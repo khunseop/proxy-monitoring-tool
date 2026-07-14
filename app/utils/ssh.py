@@ -22,6 +22,23 @@ class SSHPool:
                 cls._instance.pool_lock = threading.Lock()
         return cls._instance
 
+    IDLE_TIMEOUT_SEC = 600  # 유휴 연결 정리 기준
+
+    def _evict_idle(self, keep_key) -> None:
+        """last_used가 IDLE_TIMEOUT_SEC를 초과한 연결을 정리한다. pool_lock 보유 상태에서 호출."""
+        now = time.time()
+        for k in list(self.connections.keys()):
+            if k == keep_key:
+                continue
+            client, last_used = self.connections[k]
+            if now - last_used > self.IDLE_TIMEOUT_SEC:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                del self.connections[k]
+                logger.info(f"[SSHPool] Idle connection to {k[0]}:{k[1]} closed")
+
     def get_client(
         self,
         host: str,
@@ -36,8 +53,9 @@ class SSHPool:
         allow_agent: bool = False,
     ) -> paramiko.SSHClient:
         key = (host, port, username)
-        
+
         with self.pool_lock:
+            self._evict_idle(keep_key=key)
             if key in self.connections:
                 client, _ = self.connections[key]
                 if client.get_transport() and client.get_transport().is_active():

@@ -565,11 +565,19 @@ def get_live_log(
     host, port, username = db_proxy.host, db_proxy.port or 22, db_proxy.username
     clean = " | sed -e 's/[^[:print:]\\t]//g'"
 
-    try:
-        wc_out = ssh_exec(host, port, username, password, f"wc -l < {safe_path}", timeout_sec=5)
-        current_count = int(wc_out.strip().split()[0])
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ssh error: {str(e)}")
+    def _run_combined(tail_cmd: str) -> tuple:
+        # wc와 tail을 한 SSH 왕복으로 결합 — 출력 첫 줄이 라인 수, 이후가 로그 라인
+        cmd = f"wc -l < {safe_path}; " + tail_cmd
+        try:
+            raw = ssh_exec(host, port, username, password, cmd, timeout_sec=12)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"ssh error: {str(e)}")
+        first, _, rest = raw.partition("\n")
+        try:
+            count = int(first.strip().split()[0])
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=502, detail="ssh error: 로그 라인 수 파싱 실패")
+        return count, rest
 
     def _parse_and_filter(raw: str) -> List[Dict[str, Any]]:
         records = []
@@ -590,36 +598,28 @@ def get_live_log(
     is_initial = proxy_id not in _live_state
 
     if is_initial:
-        cmd = (
+        tail_cmd = (
             f"timeout 10s nice -n 10 ionice -c2 -n7 "
             f"tail -n {initial_lines * 10} {safe_path} | grep -F -- {safe_q} | tail -n {initial_lines}"
             + clean
         )
-        try:
-            raw = ssh_exec(host, port, username, password, cmd, timeout_sec=12)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"ssh error: {str(e)}")
-        records = _parse_and_filter(raw)
+        current_count, rest = _run_combined(tail_cmd)
+        records = _parse_and_filter(rest)
         _live_state[proxy_id] = current_count
         return {"records": records, "total_count": current_count, "is_initial": True, "new_lines": len(records)}
 
     last_count = _live_state[proxy_id]
+    offset = last_count + 1
+    tail_cmd = (
+        f"timeout 10s nice -n 10 ionice -c2 -n7 "
+        f"tail -n +{offset} {safe_path} | head -n 2000 | grep -F -- {safe_q} | head -n 500"
+        + clean
+    )
+    current_count, rest = _run_combined(tail_cmd)
     if current_count <= last_count:
         return {"records": [], "total_count": current_count, "is_initial": False, "new_lines": 0}
 
-    offset = last_count + 1
-    fetch_count = min(current_count - last_count, 2000)
-    cmd = (
-        f"timeout 10s nice -n 10 ionice -c2 -n7 "
-        f"tail -n +{offset} {safe_path} | head -n {fetch_count} | grep -F -- {safe_q} | head -n 500"
-        + clean
-    )
-    try:
-        raw = ssh_exec(host, port, username, password, cmd, timeout_sec=12)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ssh error: {str(e)}")
-
-    records = _parse_and_filter(raw)
+    records = _parse_and_filter(rest)
     _live_state[proxy_id] = current_count
     return {"records": records, "total_count": current_count, "is_initial": False, "new_lines": len(records)}
 

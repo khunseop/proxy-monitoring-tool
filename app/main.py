@@ -343,6 +343,9 @@ def healthz():
         "db": db_status,
         "collector": collector_status,
         "uptime_seconds": uptime_seconds,
+        "collection_tasks": background_collector.get_status()["active_count"],
+        "last_collect_success_at": background_collector.last_success_at,
+        "last_collect_result": background_collector.last_result,
     }
 
 
@@ -419,5 +422,8 @@ async def start_background_tasks():
 @app.on_event("shutdown")
 async def stop_background_tasks():
     from app.utils.background_collector import background_collector
+    from app.utils.ssh import ssh_pool
     # Stop retention policy task
     await background_collector.stop_retention_policy()
+    # Close pooled SSH connections
+    ssh_pool.close_all()

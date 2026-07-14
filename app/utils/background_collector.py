@@ -69,6 +69,8 @@ class BackgroundCollector:
         self._lock = asyncio.Lock()
         self._retention_task: Optional[asyncio.Task] = None
         self._retention_interval_sec = 3600  # 1시간마다 실행
+        self.last_success_at: Optional[str] = None  # 마지막 수집 성공 시각 (healthz 노출용)
+        self.last_result: Optional[dict] = None  # 마지막 수집 결과 요약
     
     async def register_websocket(self, websocket):
         """웹소켓 클라이언트 등록"""
@@ -177,6 +179,12 @@ class BackgroundCollector:
                     logger.info(f"[BackgroundCollector] Collection completed for task {task_id}: "
                               f"succeeded={result['succeeded']}, failed={result['failed']}, "
                               f"duration={collect_duration:.2f}s, next_in={interval_sec}s")
+
+                    self.last_success_at = datetime.now().isoformat()
+                    self.last_result = {
+                        "succeeded": result["succeeded"],
+                        "failed": result["failed"],
+                    }
                     
                     # 다음 수집 예정 시간 계산
                     next_collect_time = cycle_start_time + interval_sec

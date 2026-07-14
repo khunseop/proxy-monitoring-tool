@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import time
-import paramiko
 from datetime import timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from time import monotonic
@@ -15,6 +14,7 @@ from app.models.resource_usage import ResourceUsage as ResourceUsageModel
 from app.models.resource_config import ResourceConfig as ResourceConfigModel
 from app.utils.time import now_kst, KST_TZ
 from app.utils.crypto import decrypt_string_if_encrypted
+from app.utils.ssh import ssh_exec
 
 logger = logging.getLogger(__name__)
 
@@ -140,24 +140,19 @@ def is_system_interface(if_name: str) -> bool:
 
 
 def ssh_exec_and_parse_mem(host: str, port: int, username: str, password: str | None, command: str, timeout_sec: int) -> float | None:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    # SSHPool 경유로 연결 재사용 (매 수집 주기 새 핸드셰이크 방지).
+    # max_retries=1: 재시도 백오프 sleep이 executor 스레드를 점유하지 않도록.
     try:
-        client.connect(
-            hostname=host,
+        stdout_str = ssh_exec(
+            host=host,
             port=port or 22,
             username=username,
             password=password,
-            timeout=timeout_sec,
-            auth_timeout=timeout_sec,
-            banner_timeout=timeout_sec,
-            allow_agent=False,
-            look_for_keys=False,
-            compress=False,
-            disabled_algorithms={"cipher": ["3des-cbc", "des-cbc"]},
-        )
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout_sec)
-        stdout_str = stdout.read().decode(errors="ignore").strip()
+            command=command,
+            timeout_sec=timeout_sec,
+            use_pool=True,
+            max_retries=1,
+        ).strip()
         if not stdout_str:
             return None
         first_line = stdout_str.splitlines()[0] if stdout_str else ""
@@ -170,21 +165,21 @@ def ssh_exec_and_parse_mem(host: str, port: int, username: str, password: str | 
     except Exception as exc:
         logger.warning(f"[resource_collector] SSH mem failed host={host}: {exc}")
         return None
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
 
 
 def ssh_exec_and_parse_disk(host: str, port: int, user: str, password: str | None, path: str, timeout_sec: int) -> float | None:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(host, port=port, username=user, password=password, timeout=timeout_sec)
         command = f"df -k {path} | awk 'END{{print $(NF-1)}}' | sed 's/%//'"
-        _, stdout, stderr = client.exec_command(command, timeout=timeout_sec)
-        stdout_str = stdout.read().decode().strip()
+        stdout_str = ssh_exec(
+            host=host,
+            port=port or 22,
+            username=user,
+            password=password,
+            command=command,
+            timeout_sec=timeout_sec,
+            use_pool=True,
+            max_retries=1,
+        ).strip()
         if stdout_str:
             try:
                 return float(stdout_str)
@@ -194,11 +189,6 @@ def ssh_exec_and_parse_disk(host: str, port: int, user: str, password: str | Non
     except Exception as exc:
         logger.warning(f"[resource_collector] SSH disk failed host={host}: {exc}")
         return None
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
 
 
 async def ssh_get_disk_usage(proxy: Proxy, timeout_sec: int = _SSH_TIMEOUT_SEC) -> float | None:
