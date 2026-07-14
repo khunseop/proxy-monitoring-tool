@@ -23,6 +23,19 @@
 - `/healthz`에 `collection_tasks`/`last_collect_success_at`/`last_collect_result` 노출
 - (취소) `(proxy_id, id)` 복합 인덱스: SQLite에서 `id`는 rowid 별칭이라 기존 단일 인덱스 `ix_traffic_logs_proxy_id`가 이미 (proxy_id, rowid) 순서를 보장 — EXPLAIN QUERY PLAN으로 단일 proxy 조회가 정렬 없이 처리됨을 확인, 복합 인덱스는 중복이라 추가하지 않음. 다중 proxy IN 조회의 정렬은 인덱스로 회피 불가(LIMIT로 상한 제어됨).
 
+### 테스트 강화 (2026-07-14)
+
+Phase 2 리팩터링의 "변경 전후 결과 동일" 계약을 보증하는 테스트를 선행 구축 (총 64개, `pytest tests/`):
+
+- `test_traffic_logs_list_api.py` — 목록 API 페이징·정렬·필터·검색 계약 (Phase 2 인덱스/쿼리 변경 대비)
+- `test_traffic_logs_analyze_api.py` — 분석 API 집계 수치를 정확히 고정 (**Phase 2-2 SQL 전환의 기준선**): blocked 대소문자·공백 처리, 음수 바이트 클램프, anomaly 탐지 포함
+- `test_resource_usage_api.py` — `/api/history` 필터·정렬·스키마 계약 (**Phase 2-3 다운샘플링의 하위호환 기준선**)
+- `test_resource_analysis.py` — percentile 보간·시간대 밴드 수치 고정 (**Phase 2-4 기준선**)
+- `test_ssh_and_collector.py` — SSHPool 유휴 정리, 수집기 파싱 계약, `calculate_mbps` 카운터 랩/리셋 (**Phase 2-1 SNMP 통합의 델타 계산 기준선**), live 엔드포인트 SSH 1회 왕복
+- `test_db_recovery.py` — 크래시 후 WAL 데이터 보존, 손상 DB 복구, quick_check 마커
+- `test_retention.py` — resource_usage/traffic_logs retention
+- `tests/conftest.py` — 테스트가 실제 `./pmt.db`/`./logs`를 건드리지 않도록 env 격리 추가
+
 ---
 
 ## Phase 2 — 중간 위험·중간 이상 효과 (다음 순서)

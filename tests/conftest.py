@@ -1,4 +1,10 @@
 """공통 테스트 픽스처 — 인메모리 SQLite DB + TestClient"""
+import os
+
+# app 모듈 import 전에 설정해야 함 — 테스트가 실제 ./pmt.db와 ./logs를 건드리지 않도록
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+os.environ.setdefault("LOG_TO_CONSOLE", "false")
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -46,3 +52,21 @@ def client():
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def db_session():
+    """데이터 시딩용 세션. 테스트 종료 시 시딩 대상 테이블을 비워 테스트 간 격리."""
+    from app.models.traffic_log import TrafficLog
+    from app.models.resource_usage import ResourceUsage
+    from app.models.proxy import Proxy
+
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.rollback()
+        for model in (TrafficLog, ResourceUsage, Proxy):
+            db.query(model).delete(synchronize_session=False)
+        db.commit()
+        db.close()
