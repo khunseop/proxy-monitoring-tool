@@ -26,6 +26,14 @@ except Exception:
 
 
 def ensure_default_env() -> None:
+    # frozen 빌드에서는 실행 위치와 무관하게 DB(./pmt.db)·로그(./logs)가
+    # 항상 exe 옆에 생기도록 CWD를 고정한다.
+    # (app.main import 시점에 로깅/DB가 상대경로로 초기화되므로 그 전에 수행)
+    if getattr(sys, "frozen", False):
+        try:
+            os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
+        except OSError:
+            pass
     os.environ.setdefault("HOST", "0.0.0.0")
     os.environ.setdefault("PORT", "8712")
     # In frozen (PyInstaller) builds, disable docs by default to avoid missing asset errors
@@ -118,10 +126,11 @@ def main() -> None:
         log_dir.mkdir(exist_ok=True)
         
         # 안전한 핸들러 선택 (stdout이 사용 가능한지 확인)
-        handler_class = "logging.FileHandler"
+        handler_class = "logging.handlers.RotatingFileHandler"
         handler_config = {
             "filename": str(log_dir / "pmt_uvicorn.log"),
-            "mode": "a",
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 3,
             "encoding": "utf-8",
         }
         

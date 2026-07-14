@@ -46,8 +46,13 @@ _startup_logger = _logging.getLogger(__name__)
 
 
 def _recover_sqlite_db(db_url: str) -> None:
-    """SQLite DB가 손상된 경우 자동 복구를 시도합니다."""
-    import sqlite3, shutil, re
+    """SQLite DB 손상 여부를 확인하고 필요 시 자동 복구를 시도합니다.
+
+    주의: WAL/SHM 파일은 삭제하지 않는다. WAL에는 아직 메인 DB에
+    체크포인트되지 않은 커밋 데이터가 있으므로, DB를 정상적으로 열면
+    SQLite가 자동으로 복구(재적용)한다.
+    """
+    import sqlite3, shutil, re, time
 
     # sqlite:///./path.db 또는 sqlite:////abs/path.db 형태에서 파일 경로 추출
     m = re.match(r"sqlite:///(.+)", db_url)
@@ -55,54 +60,75 @@ def _recover_sqlite_db(db_url: str) -> None:
         return
     db_path = m.group(1)
 
-    _startup_logger.info("[DB] 경로: %s", os.path.abspath(db_path))
-
-    # 0단계: WAL/SHM 파일 선제 정리
-    # DELETE 모드로 전환 시 WAL 파일이 불완전하면 malformed가 발생하므로
-    # integrity_check 전에 먼저 제거한다.
-    for ext in ("-wal", "-shm"):
-        wal_path = db_path + ext
-        if os.path.exists(wal_path):
-            try:
-                os.remove(wal_path)
-                _startup_logger.info("[DB] 잔여 %s 파일 제거: %s", ext, wal_path)
-            except Exception as e:
-                _startup_logger.warning("[DB] %s 파일 제거 실패: %s", ext, e)
-
     if not os.path.exists(db_path):
         return  # 신규 파일이면 복구 불필요
 
-    # 1단계: 무결성 확인 + DELETE 모드 전환 테스트
+    _startup_logger.info(
+        "[DB] 경로: %s (크기: %.1f MB)",
+        os.path.abspath(db_path),
+        os.path.getsize(db_path) / (1024 * 1024),
+    )
+
+    # 1단계: 가벼운 열기 확인. quick_check는 DB 크기에 비례해 시작을
+    # 블로킹하므로 24시간에 한 번만 수행한다(마커 파일 mtime 기준).
+    check_marker = db_path + ".lastcheck"
+    try:
+        marker_age_hours = (time.time() - os.path.getmtime(check_marker)) / 3600
+    except OSError:
+        marker_age_hours = float("inf")
+
     try:
         conn = sqlite3.connect(db_path, timeout=5)
-        result = conn.execute("PRAGMA integrity_check").fetchone()
-        if result and result[0] == "ok":
-            # integrity는 OK이지만 모드 전환도 검증
-            try:
-                conn.execute("PRAGMA journal_mode=DELETE")
-                conn.close()
-                return  # 완전 정상
-            except Exception as e:
-                conn.close()
-                _startup_logger.error("[DB] journal_mode 전환 실패: %s — 복구를 시도합니다.", e)
-        else:
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            if marker_age_hours >= 24:
+                result = conn.execute("PRAGMA quick_check").fetchone()
+                if not result or result[0] != "ok":
+                    raise sqlite3.DatabaseError(f"quick_check 실패: {result}")
+                with open(check_marker, "w", encoding="utf-8") as f:
+                    f.write(str(int(time.time())))
+                _startup_logger.info("[DB] quick_check 통과")
+            return  # 정상
+        finally:
             conn.close()
-            _startup_logger.error("[DB] integrity_check 실패: %s — 복구를 시도합니다.", result)
     except Exception as e:
-        _startup_logger.error("[DB] DB 열기 실패: %s — 복구를 시도합니다.", e)
+        _startup_logger.error("[DB] 검사 실패: %s — 복구를 시도합니다.", e)
 
-    # 2단계: iterdump()로 데이터 추출 후 새 DB 재생성
+    # 2단계: backup API로 새 DB 재생성, 실패 시 iterdump() 폴백
     recovered_path = db_path + ".recovered"
     try:
         src = sqlite3.connect(db_path, timeout=5)
         dst = sqlite3.connect(recovered_path, timeout=5)
         try:
-            for line in src.iterdump():
+            try:
+                src.backup(dst)
+                # backup API는 손상 페이지도 그대로 복사할 수 있으므로 결과 검증
+                result = dst.execute("PRAGMA quick_check").fetchone()
+                if not result or result[0] != "ok":
+                    raise sqlite3.DatabaseError(f"backup 결과 quick_check 실패: {result}")
+            except Exception as backup_err:
+                _startup_logger.warning(
+                    "[DB] backup API 복구 실패: %s — iterdump로 재시도합니다.", backup_err
+                )
+                dst.close()
                 try:
-                    dst.execute(line)
-                except Exception:
-                    pass  # 손상 행 스킵
-            dst.commit()
+                    os.remove(recovered_path)
+                except OSError:
+                    pass
+                dst = sqlite3.connect(recovered_path, timeout=5)
+                dump_iter = src.iterdump()
+                while True:
+                    try:
+                        line = next(dump_iter)
+                    except StopIteration:
+                        break
+                    except Exception:
+                        break  # 손상 지점 이후는 읽을 수 없음 — 여기까지 복구
+                    try:
+                        dst.execute(line)
+                    except Exception:
+                        pass  # 손상 행 스킵
+                dst.commit()
         finally:
             src.close()
             dst.close()
@@ -359,7 +385,7 @@ def migrate_legacy_proxy_passwords():
             db.close()
     except Exception:
         # avoid breaking startup due to migration failure
-        pass
+        _startup_logger.warning("[Startup] 프록시 비밀번호 마이그레이션 실패", exc_info=True)
 
 
 # (removed) one-time startup cleanup for legacy accumulated rows
@@ -378,7 +404,7 @@ def migrate_resource_config_interval_sec():
         finally:
             db.close()
     except Exception:
-        pass
+        _startup_logger.warning("[Startup] interval_sec 컬럼 마이그레이션 실패", exc_info=True)
 
 
 # Start retention policy background task on startup

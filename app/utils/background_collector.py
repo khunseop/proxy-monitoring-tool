@@ -16,6 +16,49 @@ from app.utils.time import now_kst
 logger = logging.getLogger(__name__)
 
 
+def _sqlite_maintenance():
+    """WAL 체크포인트 및 조건부 VACUUM (retention 스레드에서 실행).
+
+    - wal_checkpoint(TRUNCATE): WAL 파일이 무한히 커지는 것을 방지
+    - VACUUM: 삭제로 생긴 여유 페이지가 20%를 넘거나 마지막 실행 후
+      7일이 지나면 실행 (최소 24시간 간격, 마커 파일 mtime 기준)
+    """
+    import os
+    import time
+    from app.database.database import engine
+
+    db_path = engine.url.database
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        if not db_path or db_path == ":memory:":
+            return
+
+        marker = db_path + ".lastvacuum"
+        try:
+            age_hours = (time.time() - os.path.getmtime(marker)) / 3600
+        except OSError:
+            age_hours = float("inf")
+        if age_hours < 24:
+            return
+
+        page_count = cur.execute("PRAGMA page_count").fetchone()[0]
+        freelist_count = cur.execute("PRAGMA freelist_count").fetchone()[0]
+        if page_count and (freelist_count / page_count > 0.2 or age_hours >= 24 * 7):
+            logger.info(
+                f"[BackgroundCollector] Running VACUUM (freelist={freelist_count}/{page_count} pages)"
+            )
+            cur.execute("VACUUM")
+            cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # VACUUM이 키운 WAL 정리
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
+            logger.info("[BackgroundCollector] VACUUM completed")
+    finally:
+        conn.close()
+
+
 class BackgroundCollector:
     """백그라운드 수집 작업 관리자"""
     
@@ -246,42 +289,32 @@ class BackgroundCollector:
                     errors[proxy.id] = str(e)
             
             # Bulk insert for better performance
-            collected_models: list[ResourceUsageModel] = []
+            inserted_count = 0
             if collected_data:
                 try:
                     db.bulk_insert_mappings(ResourceUsageModel, collected_data)
                     db.commit()
-                    # Single query for all inserted records instead of N individual queries
-                    inserted_proxy_ids = [d["proxy_id"] for d in collected_data]
-                    collected_models = (
-                        db.query(ResourceUsageModel)
-                        .filter(
-                            ResourceUsageModel.collected_at == collected_at_ts,
-                            ResourceUsageModel.proxy_id.in_(inserted_proxy_ids),
-                        )
-                        .all()
-                    )
-                    logger.info(f"[BackgroundCollector] Bulk inserted {len(collected_data)} records to database "
+                    inserted_count = len(collected_data)
+                    logger.debug(f"[BackgroundCollector] Bulk inserted {inserted_count} records to database "
                              f"(requested={len(proxies)}, failed={len(errors)})")
                 except Exception as e:
                     logger.error(f"[BackgroundCollector] Bulk insert failed, falling back to individual inserts: {e}")
                     db.rollback()
                     for data in collected_data:
                         try:
-                            model = ResourceUsageModel(**data)
-                            db.add(model)
-                            collected_models.append(model)
+                            db.add(ResourceUsageModel(**data))
+                            inserted_count += 1
                         except Exception as e2:
                             logger.error(f"[BackgroundCollector] Failed to insert record: {e2}")
                     db.commit()
-            
+
             # 저장 완료 로그
-            logger.info(f"[BackgroundCollector] Saved {len(collected_models)} records to database "
+            logger.debug(f"[BackgroundCollector] Saved {inserted_count} records to database "
                        f"(requested={len(proxies)}, failed={len(errors)})")
-            
+
             return {
                 "requested": len(proxies),
-                "succeeded": len(collected_models),
+                "succeeded": inserted_count,
                 "failed": len(errors),
                 "errors": errors
             }
@@ -375,13 +408,16 @@ class BackgroundCollector:
     
     async def _periodic_retention(self):
         """주기적으로 보존 정책 실행"""
-        from app.services.resource_collector import enforce_resource_usage_retention
+        from app.services.resource_collector import (
+            enforce_resource_usage_retention,
+            enforce_traffic_log_retention,
+        )
         from app.database.database import SessionLocal
-        
+
         try:
             while True:
                 await asyncio.sleep(self._retention_interval_sec)
-                
+
                 try:
                     logger.info("[BackgroundCollector] Running retention policy (90 days)")
                     # Run in thread pool to not block event loop
@@ -389,9 +425,11 @@ class BackgroundCollector:
                         db = SessionLocal()
                         try:
                             enforce_resource_usage_retention(db, days=90)
+                            enforce_traffic_log_retention(db, days=7)
                         finally:
                             db.close()
-                    
+                        _sqlite_maintenance()
+
                     await asyncio.to_thread(run_retention)
                     logger.info("[BackgroundCollector] Retention policy completed")
                 except Exception as e:

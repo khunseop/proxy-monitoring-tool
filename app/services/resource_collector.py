@@ -423,7 +423,7 @@ async def collect_for_proxy(proxy: Proxy, oids: Dict[str, str], community: str, 
         if_logs = [f"{n}(in={d.get('in_mbps',0):.2f},out={d.get('out_mbps',0):.2f})" for n, d in result["interface_mbps"].items()]
         log_parts.append(f"interfaces=[{','.join(if_logs)}]")
     
-    logger.info(f"[resource_collector] Collected: {' '.join(log_parts)}")
+    logger.debug(f"[resource_collector] Collected: {' '.join(log_parts)}")
     return proxy.id, result, None
 
 
@@ -435,4 +435,21 @@ def enforce_resource_usage_retention(db: Session, days: int = 90) -> None:
         logger.info(f"[resource_collector] Enforced retention policy: {days} days.")
     except Exception as e:
         logger.error(f"[resource_collector] Retention failed: {e}")
+        db.rollback()
+
+
+def enforce_traffic_log_retention(db: Session, days: int = 7) -> None:
+    """오래된 트래픽 로그와 삭제된 프록시의 잔존 행을 정리합니다."""
+    from app.models.traffic_log import TrafficLog as TrafficLogModel
+
+    cutoff = now_kst() - timedelta(days=days)
+    try:
+        expired = db.query(TrafficLogModel).filter(TrafficLogModel.collected_at < cutoff).delete(synchronize_session=False)
+        orphaned = db.query(TrafficLogModel).filter(
+            ~TrafficLogModel.proxy_id.in_(db.query(Proxy.id))
+        ).delete(synchronize_session=False)
+        db.commit()
+        logger.info(f"[resource_collector] Traffic log retention: {days} days (expired={expired}, orphaned={orphaned}).")
+    except Exception as e:
+        logger.error(f"[resource_collector] Traffic log retention failed: {e}")
         db.rollback()
