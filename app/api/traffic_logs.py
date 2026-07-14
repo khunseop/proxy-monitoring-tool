@@ -15,7 +15,6 @@ from app.schemas.traffic_log import TrafficLogResponse, TrafficLogRecord, Traffi
 from app.models.traffic_log import TrafficLog as TrafficLogModel
 from app.utils.traffic_log_parser import parse_log_line
 from app.utils.crypto import decrypt_string_if_encrypted
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
 
@@ -114,14 +113,20 @@ def _fetch_and_parse_for_proxy(db_proxy: Proxy, q: Optional[str], limit: int, di
 
 
 @router.post("/traffic-logs/collect")
-def collect_traffic_logs_task(
+async def collect_traffic_logs_task(
     proxy_ids: str = Query(..., description="Comma-separated list of proxy IDs"),
     db: Session = Depends(get_db),
     q: Optional[str] = Query(default=None, max_length=256),
     limit: int = Query(default=5000, ge=1, le=50000),
     direction: str = Query(default="tail", pattern=r"^(head|tail)$"),
 ):
-    """프록시에서 로그를 읽어와 DB에 저장합니다 (완료 후 응답)."""
+    """프록시에서 로그를 읽어와 DB에 저장합니다 (완료 후 응답).
+
+    async + to_thread: 수집(SSH·파싱·삽입)이 수십 초 걸려도 FastAPI의
+    동기 핸들러용 스레드풀을 점유하지 않는다 (다른 API 응답 지연 방지).
+    """
+    import asyncio
+
     try:
         p_ids = [int(x.strip()) for x in proxy_ids.split(",") if x.strip()]
     except ValueError:
@@ -153,13 +158,13 @@ def collect_traffic_logs_task(
         finally:
             local_db.close()
 
-    with ThreadPoolExecutor(max_workers=min(len(proxies), 4)) as executor:
-        futures = [executor.submit(collect_one, p) for p in proxies]
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception:
-                pass
+    sem = asyncio.Semaphore(4)  # 기존 ThreadPoolExecutor(max_workers=4)와 동일한 동시성 상한
+
+    async def run_one(p):
+        async with sem:
+            await asyncio.to_thread(collect_one, p)
+
+    await asyncio.gather(*(run_one(p) for p in proxies))
 
     return {
         "message": "Collection complete",
@@ -659,6 +664,12 @@ def reset_live_log_state(proxy_id: int):
     """실시간 감시 상태(라인 오프셋)를 초기화합니다."""
     _live_state.pop(proxy_id, None)
     return {"reset": True}
+
+
+def cleanup_live_state(active_proxy_ids: set) -> None:
+    """삭제된 프록시의 실시간 감시 상태를 정리한다 (retention 주기 호출)."""
+    for pid in [p for p in list(_live_state) if p not in active_proxy_ids]:
+        _live_state.pop(pid, None)
 
 
 @router.get("/traffic-logs/{proxy_id}", response_model=TrafficLogResponse)

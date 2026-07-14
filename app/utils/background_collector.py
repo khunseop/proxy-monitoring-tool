@@ -417,9 +417,11 @@ class BackgroundCollector:
     async def _periodic_retention(self):
         """주기적으로 보존 정책 실행"""
         from app.services.resource_collector import (
+            cleanup_stale_caches,
             enforce_resource_usage_retention,
             enforce_traffic_log_retention,
         )
+        from app.api.traffic_logs import cleanup_live_state
         from app.database.database import SessionLocal
 
         try:
@@ -434,9 +436,13 @@ class BackgroundCollector:
                         try:
                             enforce_resource_usage_retention(db, days=90)
                             enforce_traffic_log_retention(db, days=7)
+                            active_ids = {pid for (pid,) in db.query(Proxy.id).all()}
                         finally:
                             db.close()
                         _sqlite_maintenance()
+                        # 삭제된 프록시의 인메모리 캐시 키 정리
+                        cleanup_stale_caches(active_ids)
+                        cleanup_live_state(active_ids)
 
                     await asyncio.to_thread(run_retention)
                     logger.info("[BackgroundCollector] Retention policy completed")

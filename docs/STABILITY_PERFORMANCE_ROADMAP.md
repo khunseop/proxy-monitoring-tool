@@ -45,25 +45,15 @@ Phase 2 리팩터링의 "변경 전후 결과 동일" 계약을 보증하는 테
 
 테스트: 78개 통과 (`pytest tests/`). 프런트 무수정 — `/api/history`의 `max_points`는 서버 기본값 2000 적용.
 
----
+### Phase 3 (2026-07-15)
 
-## Phase 3 — 선택 (필요 시)
+- **3-1. collect 비동기화 (A안)** — `traffic_logs.py`: `async def` + `asyncio.to_thread` + Semaphore(4). 수집이 수십 초 걸려도 FastAPI 동기 핸들러용 스레드풀을 점유하지 않아 다른 API 응답 지연 방지. 응답 스키마 불변(프런트 무수정). B안(202 + task_id 폴링)은 대량 수집이 잦은 사용 패턴이 확인되면 그때 검토.
+- **3-2. 인메모리 캐시 위생** — `cleanup_stale_caches()`(resource_collector): 삭제된 프록시의 카운터 캐시 키 + 만료된 mem 캐시 항목 제거. `cleanup_live_state()`(api/traffic_logs): 삭제된 프록시의 live 오프셋 제거. 둘 다 1시간 retention 주기에서 호출.
 
-### 3-1. `/api/traffic-logs/collect` 비동기화
+테스트: 84개 통과. **로드맵 전 항목 완료.**
 
-- **현재**: 동기 `def` 핸들러 안에서 ThreadPoolExecutor(≤4)로 SSH 수집 완료까지 블로킹 — 수 초~수십 초 요청 점유, FastAPI 스레드풀 고갈 위험.
-- **A안(저위험, 프런트 무수정)**: `async def` + `asyncio.to_thread` gather — 스레드풀 고갈 완화. 응답은 완료 후 반환.
-- **B안(효과 큼, 프런트 수정)**: 202 + `task_id` 즉시 반환 + 상태 폴링 엔드포인트. `traffic_logs.js` 수집 버튼 핸들러를 폴링 루프로 교체 필요.
-- 권장: A 먼저. B는 5만 줄×여러 프록시 수집이 잦은 사용 패턴이 확인될 때.
-- **검증**: 수집 중 다른 API 동시 호출 응답 지연 측정 비교.
+## 운영 반영 시 참고
 
-### 3-2. 인메모리 캐시 위생
-
-- `_INTERFACE_COUNTER_CACHE`, `_GLOBAL_TRAFFIC_COUNTER_CACHE`, `_MEM_CACHE`(resource_collector.py), `_live_state`(api/traffic_logs.py)는 삭제된 프록시 키가 남아 무한 증가 가능(항목이 작아 실해악 낮음).
-- retention 주기(`_periodic_retention`)에서 존재하지 않는 proxy_id 키 제거 추가.
-
-## 진행 원칙
-
-- Phase 2-1(SNMP)은 수집 데이터 연속성에 영향 → **단독 커밋 + 수 주기 관찰 후** 다음 항목 진행.
-- 2-2/2-3/2-4는 읽기 경로만이라 병행 가능. 2-3만 프런트 확인 필요.
-- 각 단계 후 PyInstaller 재빌드 + 윈도우 스모크 테스트(시작 → 자동 수집 → 각 페이지 로드).
+- PyInstaller 재빌드(`scripts/build_windows.ps1`) 후 윈도우 스모크 테스트(시작 → 자동 수집 → 각 페이지 로드).
+- SNMP 통합(2-1)은 실장비에서 수 주기 값 연속성 관찰 권장 (cpu/mem/mbps 패턴, 첫 주기 0.0 → 이후 정상 델타).
+- 향후 추가 개선이 필요해지면 후보: 다운샘플링에 MAX 병행(피크 보존), collect B안(백그라운드 job), 트래픽/세션 라이브의 WebSocket 전환, 데이터 계층화(시간/일 평균 테이블).

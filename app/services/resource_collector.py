@@ -515,6 +515,17 @@ def enforce_resource_usage_retention(db: Session, days: int = 90) -> None:
         db.rollback()
 
 
+def cleanup_stale_caches(active_proxy_ids: set) -> None:
+    """삭제된 프록시의 카운터 캐시 키와 만료된 mem 캐시 항목을 정리한다 (retention 주기 호출)."""
+    for key in [k for k in _INTERFACE_COUNTER_CACHE if k[0] not in active_proxy_ids]:
+        _INTERFACE_COUNTER_CACHE.pop(key, None)
+    for key in [k for k in _GLOBAL_TRAFFIC_COUNTER_CACHE if k[0] not in active_proxy_ids]:
+        _GLOBAL_TRAFFIC_COUNTER_CACHE.pop(key, None)
+    now = monotonic()
+    for key in [k for k, v in _MEM_CACHE.items() if v[1] <= now]:
+        _MEM_CACHE.pop(key, None)
+
+
 def enforce_traffic_log_retention(db: Session, days: int = 7) -> None:
     """오래된 트래픽 로그와 삭제된 프록시의 잔존 행을 정리합니다."""
     from app.models.traffic_log import TrafficLog as TrafficLogModel
