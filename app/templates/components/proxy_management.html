@@ -16,22 +16,36 @@
 <!-- 프록시 목록 섹션 -->
 <div id="proxy-list-section" class="panel-content">
     <div class="settings-bar mb-5">
-        <div class="buttons mb-0">
+        <div class="is-flex is-align-items-center" style="gap: 1rem;">
+            <div class="is-flex is-align-items-center" style="gap: 0.4rem;">
+                <span class="filter-label">그룹</span>
+                <div class="select is-small">
+                    <select id="proxyGroupFilter">
+                        <option value="">전체</option>
+                    </select>
+                </div>
+            </div>
+            <input class="input is-small" id="proxySearchInput" type="text" placeholder="호스트 검색..." style="width: 180px;">
+        </div>
+        <div class="is-flex is-align-items-center ml-auto" style="gap: 0.75rem;">
             <button class="button is-primary is-small px-4" onclick="openModal('proxy')">
                 <span>프록시 추가</span>
             </button>
             <button class="button is-subtle is-small px-3" onclick="openBulkProxyModal()">
                 <span>일괄 등록</span>
             </button>
-        </div>
-        <div class="buttons mb-0 ml-auto">
-            <button class="button is-subtle is-small px-3" onclick="exportProxiesToCsv()" title="내보내기">
+            <span class="settings-bar-separator"></span>
+            <button class="button is-ghost is-small px-3" onclick="exportProxiesToCsv()" title="내보내기" style="color: var(--color-text-muted);">
                 <span>내보내기</span>
             </button>
-            <button class="button is-subtle is-small px-3" onclick="downloadProxySampleCsv()" title="샘플 다운로드">
+            <button class="button is-ghost is-small px-3" onclick="downloadProxySampleCsv()" title="샘플 다운로드" style="color: var(--color-text-muted);">
                 <span>샘플 CSV</span>
             </button>
         </div>
+    </div>
+
+    <div class="is-flex is-align-items-center is-justify-content-flex-end" style="height: 18px; margin-bottom: 4px;">
+        <span id="proxyRowCount" class="is-size-7 has-text-grey-light" style="display:none;"></span>
     </div>
 
     <div class="table-container">
@@ -229,20 +243,23 @@
 <!-- 일괄 등록 모달 -->
 <div class="modal" id="bulkProxyModal">
     <div class="modal-background"></div>
-    <div class="modal-card" style="width: 500px;">
+    <div class="modal-card" style="width: 760px;">
         <header class="modal-card-head py-4 px-5">
             <p class="modal-card-title is-size-5 has-text-weight-bold">프록시 일괄 등록</p>
             <button class="delete" aria-label="close" onclick="closeBulkProxyModal()"></button>
         </header>
         <section class="modal-card-body p-5">
             <div class="notification is-info is-light p-4 is-size-7 mb-4">
-                CSV 파일을 업로드하여 여러 프록시를 한 번에 등록합니다.
-                <br>형식: <strong>host, username, password, group_name, traffic_log_path, description</strong>
+                엑셀/스프레드시트에서 복사한 내용을 붙여넣거나 CSV 파일을 선택하세요. 콤마(,) 또는 탭 구분을 지원하며 헤더 행은 자동으로 무시됩니다.
+                <br>컬럼 순서: <strong>host, username, password</strong>(필수), group_name, traffic_log_path, is_active, description, oids_json
+            </div>
+            <div class="field">
+                <textarea class="textarea is-small" id="bulkProxyInput" rows="8" style="font-family: monospace; font-size: 0.8rem;" placeholder="10.10.10.1,admin,password123,서울센터,/var/log/mwg/traffic.log,true,Primary MWG&#10;10.10.10.2,admin,password456,서울센터"></textarea>
             </div>
             <div class="field">
                 <div class="file is-small has-name is-fullwidth">
                     <label class="file-label">
-                        <input class="file-input" type="file" id="bulkProxyFile" accept=".csv" onchange="$('#bulkProxyFileName').text(this.files[0]?.name || '선택된 파일 없음')">
+                        <input class="file-input" type="file" id="bulkProxyFile" accept=".csv,.txt,.tsv">
                         <span class="file-cta">
                             <span class="file-label">CSV 파일 선택...</span>
                         </span>
@@ -250,10 +267,26 @@
                     </label>
                 </div>
             </div>
+            <div id="bulkPreviewWrap" style="display:none; max-height: 260px; overflow-y: auto; border: 1px solid var(--color-border); border-radius: var(--radius-md);">
+                <table class="table is-fullwidth is-narrow settings-table mb-0">
+                    <thead>
+                        <tr>
+                            <th style="width: 40px;">#</th>
+                            <th>호스트</th>
+                            <th>사용자</th>
+                            <th>그룹</th>
+                            <th class="has-text-centered" style="width: 60px;">활성</th>
+                            <th style="width: 200px;">상태</th>
+                        </tr>
+                    </thead>
+                    <tbody id="bulkPreviewBody"></tbody>
+                </table>
+            </div>
+            <p id="bulkPreviewSummary" class="is-size-7 has-text-grey mt-2" style="display:none;"></p>
         </section>
         <footer class="modal-card-foot is-justify-content-flex-end py-3 px-5">
             <button class="button is-subtle is-small px-4" onclick="closeBulkProxyModal()">취소</button>
-            <button class="button is-primary is-small px-5" onclick="submitBulkProxies()">업로드</button>
+            <button class="button is-primary is-small px-5" id="bulkSubmitBtn" onclick="submitBulkProxies()" disabled>등록</button>
         </footer>
     </div>
 </div>
