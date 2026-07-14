@@ -45,6 +45,77 @@ _SSH_SEMAPHORE = asyncio.Semaphore(_SSH_MAX_CONCURRENCY)
 _SSH_TIMEOUT_SEC = max(1, int(os.getenv("RU_SSH_TIMEOUT_SEC", "5")))
 
 
+# 한 GET 요청에 담는 최대 OID 수 (PDU 크기 제한 대비)
+_SNMP_CHUNK_SIZE = 16
+
+
+async def snmp_get_many(
+    host: str,
+    port: int,
+    community: str,
+    oids: List[str],
+    timeout_sec: int = 2,
+    attempts: int = 2,
+) -> Dict[str, float | None]:
+    """여러 OID를 프록시당 한 번의 세션·GET(청크 단위)으로 조회한다.
+
+    - 일시적 실패(타임아웃 등)는 attempts회까지 재시도.
+    - SNMP 프로토콜 오류(v1은 잘못된 OID 1개로 전체 GET이 실패)는
+      해당 청크만 개별 snmp_get으로 폴백해 나머지 지표를 살린다.
+    - 반환: 요청 OID → float 값 (실패/미존재는 None)
+    """
+    from aiosnmp.exceptions import SnmpErrorStatus
+
+    result: Dict[str, float | None] = {oid: None for oid in oids}
+    if not oids:
+        return result
+
+    unique_oids = list(dict.fromkeys(oids))
+    chunks = [unique_oids[i:i + _SNMP_CHUNK_SIZE] for i in range(0, len(unique_oids), _SNMP_CHUNK_SIZE)]
+
+    for chunk in chunks:
+        varbinds = None
+        protocol_error = False
+        last_exc: Exception | None = None
+        for _ in range(max(1, attempts)):
+            try:
+                async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
+                    varbinds = await snmp.get(chunk)
+                break
+            except SnmpErrorStatus as exc:
+                protocol_error = True
+                last_exc = exc
+                break  # 프로토콜 오류는 재시도 무의미
+            except Exception as exc:
+                last_exc = exc
+
+        if varbinds is None:
+            if protocol_error:
+                # v1 등에서 OID 1개 때문에 전체가 실패한 경우 → 개별 조회로 살릴 수 있는 지표 회수
+                logger.warning(
+                    f"[resource_collector] SNMP multi-get protocol error host={host}: {last_exc} — 개별 GET 폴백"
+                )
+                for oid in chunk:
+                    result[oid] = await snmp_get(host, port, community, oid, timeout_sec)
+            else:
+                logger.warning(
+                    f"[resource_collector] SNMP multi-get failed host={host} oids={len(chunk)}: {last_exc}"
+                )
+            continue
+
+        by_norm = {oid.lstrip('.'): oid for oid in chunk}
+        for vb in varbinds:
+            key = by_norm.get(str(vb.oid).lstrip('.'))
+            if key is None:
+                continue
+            try:
+                result[key] = float(vb.value)
+            except (TypeError, ValueError):
+                result[key] = None  # NoSuchObject 등 값 없는 varbind
+
+    return result
+
+
 async def snmp_get(host: str, port: int, community: str, oid: str, timeout_sec: int = 2) -> float | None:
     try:
         async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
@@ -293,25 +364,24 @@ async def collect_interface_mbps_from_oids(proxy: Proxy, community: str, interfa
     try:
         current_time = monotonic()
         result: Dict[str, Dict[str, Any]] = {}
-        tasks = []
-        task_metadata = []
+        oid_meta: list = []  # (if_name, direction, oid)
         for if_name, oids in interface_oids.items():
             in_oid = oids.get('in_oid', '').strip() if isinstance(oids, dict) else ''
             out_oid = oids.get('out_oid', '').strip() if isinstance(oids, dict) else ''
             if isinstance(oids, str): in_oid = oids.strip()
-            
+
             if in_oid:
-                tasks.append(snmp_get(proxy.host, 161, community, in_oid))
-                task_metadata.append((if_name, 'in'))
+                oid_meta.append((if_name, 'in', in_oid))
             if out_oid:
-                tasks.append(snmp_get(proxy.host, 161, community, out_oid))
-                task_metadata.append((if_name, 'out'))
-        
-        if not tasks: return None
-        counter_values = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for (if_name, direction), counter_value in zip(task_metadata, counter_values):
-            if isinstance(counter_value, Exception) or counter_value is None: continue
+                oid_meta.append((if_name, 'out', out_oid))
+
+        if not oid_meta: return None
+        # 인터페이스 OID 전체를 단일 GET(청크)으로 조회
+        values = await snmp_get_many(proxy.host, 161, community, [o for _, _, o in oid_meta])
+
+        for if_name, direction, oid in oid_meta:
+            counter_value = values.get(oid)
+            if counter_value is None: continue
             try:
                 current_counter = int(counter_value)
             except (ValueError, TypeError): continue
@@ -360,6 +430,7 @@ async def collect_for_proxy(proxy: Proxy, oids: Dict[str, str], community: str, 
     
     tasks: list = []
     keys: list[str] = []
+    snmp_key_oids: list = []  # SNMP 스칼라 지표 (key, oid) — 단일 GET으로 묶음
     for key, oid in final_oids.items():
         if key not in SUPPORTED_KEYS: continue
         if key == "mem" and isinstance(oid, str) and oid.lower().strip().startswith("ssh"):
@@ -367,7 +438,11 @@ async def collect_for_proxy(proxy: Proxy, oids: Dict[str, str], community: str, 
         elif key == "disk" and isinstance(oid, str) and oid.lower().strip().startswith("ssh"):
             keys.append(key); tasks.append(ssh_get_disk_usage(proxy))
         else:
-            keys.append(key); tasks.append(snmp_get(proxy.host, 161, community, oid))
+            snmp_key_oids.append((key, oid))
+
+    if snmp_key_oids:
+        keys.append("__snmp_many__")
+        tasks.append(snmp_get_many(proxy.host, 161, community, [o for _, o in snmp_key_oids]))
 
     if final_interface_oids:
         tasks.append(collect_interface_mbps_from_oids(proxy, community, final_interface_oids))
@@ -375,12 +450,24 @@ async def collect_for_proxy(proxy: Proxy, oids: Dict[str, str], community: str, 
 
     if tasks:
         current_time = monotonic()
-        values = await asyncio.gather(*tasks, return_exceptions=True)
-        for key, value in zip(keys, values):
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 다중 GET 결과를 지표별 (key, value) 목록으로 전개 — 이후 델타 계산 로직은 기존과 동일
+        key_values: list = []
+        for key, value in zip(keys, gathered):
+            if key == "__snmp_many__":
+                if isinstance(value, Exception) or value is None:
+                    key_values.extend((k, None) for k, _ in snmp_key_oids)
+                else:
+                    key_values.extend((k, value.get(o)) for k, o in snmp_key_oids)
+            else:
+                key_values.append((key, value))
+
+        for key, value in key_values:
             if isinstance(value, Exception) or value is None:
                 result[key] = None
                 continue
-            
+
             if key in ["http", "https", "http2", "blocked"]:
                 try:
                     current_counter = int(value)

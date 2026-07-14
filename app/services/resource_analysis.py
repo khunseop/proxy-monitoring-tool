@@ -24,8 +24,22 @@ def _is_business_hour(dt: datetime) -> bool:
     return local.weekday() < 5 and 9 <= local.hour < 18
 
 
-def _get_val(row: ResourceUsageModel, metric: str) -> Optional[float]:
-    return getattr(row, metric, None)
+def _fetch_rows(
+    db: Session,
+    proxy_ids: List[int],
+    start_time: Optional[datetime],
+    end_time: Optional[datetime],
+    metrics: List[str],
+    order: bool = False,
+):
+    """(proxy_id, collected_at, *metric값) 튜플만 로드 — ORM 전체 컬럼 로드를 피해
+    대량 구간 조회의 메모리·CPU를 줄인다. 결과 수치는 기존과 동일해야 한다."""
+    cols = [ResourceUsageModel.proxy_id, ResourceUsageModel.collected_at]
+    cols += [getattr(ResourceUsageModel, m) for m in metrics]
+    q = _base_query(db, proxy_ids, start_time, end_time).with_entities(*cols)
+    if order:
+        q = q.order_by(ResourceUsageModel.proxy_id, ResourceUsageModel.collected_at)
+    return q.all()
 
 
 def _percentile(sorted_vals: List[float], p: float) -> float:
@@ -61,18 +75,18 @@ def compute_percentiles(
     metrics: List[str],
 ) -> List[Dict[str, Any]]:
     pmap = _proxy_map(db, proxy_ids)
-    grouped: Dict[int, List[ResourceUsageModel]] = {}
-    for row in _base_query(db, proxy_ids, start_time, end_time).all():
-        if business_hours and not _is_business_hour(row.collected_at):
+    grouped: Dict[int, list] = {}
+    for row in _fetch_rows(db, proxy_ids, start_time, end_time, metrics):
+        if business_hours and not _is_business_hour(row[1]):
             continue
-        grouped.setdefault(row.proxy_id, []).append(row)
+        grouped.setdefault(row[0], []).append(row)
 
     results = []
     for pid in proxy_ids:
         rows = grouped.get(pid, [])
         host = pmap.get(pid, f'#{pid}')
-        for m in metrics:
-            vals = sorted(v for row in rows if (v := _get_val(row, m)) is not None)
+        for idx, m in enumerate(metrics):
+            vals = sorted(v for row in rows if (v := row[2 + idx]) is not None)
             if not vals:
                 results.append({'proxy_id': pid, 'host': host, 'metric': m, 'count': 0,
                                 'p50': None, 'p95': None, 'p99': None, 'mean': None, 'max': None})
@@ -98,12 +112,11 @@ def compute_time_in_band(
 ) -> List[Dict[str, Any]]:
     pmap = _proxy_map(db, proxy_ids)
     grouped: Dict[int, List[float]] = {}
-    for row in _base_query(db, proxy_ids, start_time, end_time).all():
-        if business_hours and not _is_business_hour(row.collected_at):
+    for pid_, ts, val in _fetch_rows(db, proxy_ids, start_time, end_time, [metric]):
+        if business_hours and not _is_business_hour(ts):
             continue
-        val = _get_val(row, metric)
         if val is not None:
-            grouped.setdefault(row.proxy_id, []).append(val)
+            grouped.setdefault(pid_, []).append(val)
 
     results = []
     for pid in proxy_ids:
@@ -134,14 +147,10 @@ def compute_threshold_duration(
     threshold: float,
 ) -> List[Dict[str, Any]]:
     pmap = _proxy_map(db, proxy_ids)
-    q = _base_query(db, proxy_ids, start_time, end_time)
-    q = q.order_by(ResourceUsageModel.proxy_id, ResourceUsageModel.collected_at)
-
     grouped: Dict[int, List[Tuple[datetime, float]]] = {}
-    for row in q.all():
-        val = _get_val(row, metric)
+    for pid_, ts, val in _fetch_rows(db, proxy_ids, start_time, end_time, [metric], order=True):
         if val is not None:
-            grouped.setdefault(row.proxy_id, []).append((row.collected_at, val))
+            grouped.setdefault(pid_, []).append((ts, val))
 
     results = []
     for pid in proxy_ids:
@@ -208,13 +217,12 @@ def compute_heatmap_weekly(
     # {proxy_id: {weekday: {hour: [values]}}}
     grouped: Dict[int, Dict[int, Dict[int, List[float]]]] = {}
 
-    for row in _base_query(db, proxy_ids, start_time, end_time).all():
-        val = _get_val(row, metric)
+    for pid_, ts, val in _fetch_rows(db, proxy_ids, start_time, end_time, [metric]):
         if val is None:
             continue
-        local = row.collected_at.astimezone(KST_TZ)
+        local = ts.astimezone(KST_TZ)
         wd, hr = local.weekday(), local.hour
-        grouped.setdefault(row.proxy_id, {}).setdefault(wd, {}).setdefault(hr, []).append(val)
+        grouped.setdefault(pid_, {}).setdefault(wd, {}).setdefault(hr, []).append(val)
 
     results = []
     for pid in proxy_ids:
@@ -255,14 +263,10 @@ def compute_smoothed(
     max_points: int = 2000,
 ) -> List[Dict[str, Any]]:
     pmap = _proxy_map(db, proxy_ids)
-    q = _base_query(db, proxy_ids, start_time, end_time)
-    q = q.order_by(ResourceUsageModel.proxy_id, ResourceUsageModel.collected_at)
-
     grouped: Dict[int, List[Tuple[datetime, float]]] = {}
-    for row in q.all():
-        val = _get_val(row, metric)
+    for pid_, ts, val in _fetch_rows(db, proxy_ids, start_time, end_time, [metric], order=True):
         if val is not None:
-            grouped.setdefault(row.proxy_id, []).append((row.collected_at, val))
+            grouped.setdefault(pid_, []).append((ts, val))
 
     half_sec = window_min * 30  # half-window in seconds
 

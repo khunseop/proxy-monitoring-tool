@@ -36,45 +36,16 @@ Phase 2 리팩터링의 "변경 전후 결과 동일" 계약을 보증하는 테
 - `test_retention.py` — resource_usage/traffic_logs retention
 - `tests/conftest.py` — 테스트가 실제 `./pmt.db`/`./logs`를 건드리지 않도록 env 격리 추가
 
+### Phase 2 (2026-07-15)
+
+- **2-1. SNMP 다중 OID 단일 GET** — `snmp_get_many()` 신규(`resource_collector.py`): 16개 단위 청크, 일시 실패 1회 재시도, `SnmpErrorStatus`(v1식 프로토콜 오류) 시 개별 GET 폴백으로 생존 지표 회수. `collect_for_proxy`의 스칼라 지표와 `collect_interface_mbps_from_oids`의 인터페이스 OID를 각각 GET 1회로 통합. 델타 캐시 구조·`monotonic()` 단일 타임스탬프 방식은 유지 (테스트: `test_snmp_collect.py`).
+- **2-2. analyze SQL GROUP BY 전환** — `traffic_logs.py`: 전체 행 로드+Counter → SQL 집계. 음수 클램프는 `case((col > 0, col), else_=0)`, blocked는 `lower(trim(action_names))=='block'`, NULL/0 상태코드는 "Unknown"으로 병합. 응답 JSON 구조 동일, anomaly 탐지는 기존 파이썬 함수 재사용 (계약 테스트로 수치 동일성 확인됨).
+- **2-3. /api/history 다운샘플링** — `max_points`(기본 2000) 파라미터 추가, 버킷 폭 60초 미만이면 원본 경로(완전 하위호환). 확인된 사실: `DateTime(timezone=True)`여도 SQLite에는 **오프셋 없는 KST 벽시계 문자열**로 저장됨 → `strftime('%s')`가 +9h 상수 오프셋을 갖지만 버킷 경계가 균일해 그룹핑에 안전. `interface_mbps`·메타는 버킷 내 `MAX(id)` 행 대표.
+- **2-4. resource_analysis 튜플 로드** — `_fetch_rows()`로 `with_entities(proxy_id, collected_at, metric...)`만 로드, ORM 전체 엔티티 생성 제거. 결과 수치 불변(전 함수 계약 테스트 통과). 참고: API 핸들러가 요청당 compute 1개만 호출하므로 rows 공유 인자는 불필요해 도입하지 않음.
+
+테스트: 78개 통과 (`pytest tests/`). 프런트 무수정 — `/api/history`의 `max_points`는 서버 기본값 2000 적용.
+
 ---
-
-## Phase 2 — 중간 위험·중간 이상 효과 (다음 순서)
-
-### 2-1. SNMP 다중 OID 단일 GET 통합
-
-- **현재**: `snmp_get`(`resource_collector.py`)이 OID당 새 `Snmp` 세션 + 단일 get. 프록시당 (지표 수 + 인터페이스 OID 수)만큼 UDP 세션. 타임아웃 2초, 재시도 없음 → 일시 패킷 유실 시 지표 조용히 누락.
-- **변경**:
-  - 신규 `snmp_get_many(host, port, community, oids: List[str], timeout_sec=2, retries=1) -> Dict[str, float|None]`: 한 세션에서 `snmp.get([oid, ...])`. **구현 전 aiosnmp의 다중 OID `get` 시그니처를 로컬 스크립트로 확인할 것.** 응답 varbind OID는 선행 `.` 정규화(`lstrip('.')`) 후 요청 OID에 매핑.
-  - `collect_for_proxy`: SNMP 지표들을 1회 GET으로, `collect_interface_mbps_from_oids`의 in/out OID들도 1회 GET으로. SSH 기반 mem/disk는 기존 별도 태스크 유지.
-  - 실패 시 1회 재시도. 인터페이스 OID가 많으면(20개+) 10~16개 단위 청크 분할.
-  - **SNMPv1 방어**: v1은 잘못된 OID 1개로 전체 GET 실패 → `error_status` 발생 시 개별 `snmp_get` 폴백 루프.
-- **델타 캐시 호환**: `_GLOBAL_TRAFFIC_COUNTER_CACHE`/`_INTERFACE_COUNTER_CACHE` 구조·`monotonic()` 단일 타임스탬프 방식 유지 — 값 배분 후 델타 분기 코드는 손대지 않음. 오히려 지표 간 시각 오차가 줄어 mbps 정확도 향상.
-- **위험**: 중간 — 장비별 SNMP 구현 편차(varbind 순서, PDU 크기).
-- **검증**: 동일 장비에서 변경 전후 5주기 값 비교(첫 주기 0.0 → 둘째 주기 정상 델타 패턴 유지). 잘못된 OID 1개 섞어 나머지 지표 생존 확인.
-
-### 2-2. `/api/traffic-logs/analyze`를 SQL GROUP BY로 전환
-
-- **현재**: 전체 행 `.all()` 후 파이썬 Counter 집계(`traffic_logs.py` analyze 엔드포인트). 5만 행이면 ORM 객체 5만 개 → 메모리 수백 MB, 수 초 소요.
-- **변경**: hosts/clients/statuses/proxies/summary를 `func.count/func.sum` + GROUP BY로. 음수 방어는 `case((col > 0, col), else_=0)`(SQLite에 2인자 max 없음). `action_names` 비교는 파이썬의 `.strip().lower()=='block'`과 일치하도록 `func.lower(func.trim(...))`. blocked/error 카운트 dict를 만들어 기존 `_detect_traffic_anomalies`(순수 파이썬)에 그대로 전달.
-- **응답 JSON 구조 완전 동일 유지** → 프런트(`traffic_logs_analyze.js`) 무수정.
-- **검증**: 동일 DB에서 변경 전후 응답 diff(총계, 상위 10개 host/client, anomalies 수). 빈 DB 케이스.
-
-### 2-3. `/api/history` 시간 버킷 다운샘플링
-
-- **현재**: `resource_usage.py`의 `/api/history`가 기간 내 전체 행 `.all()` — 90일이면 수십만 행 직렬화.
-- **변경**:
-  - 파라미터 추가: `max_points: int = Query(2000, ge=100, le=20000)`, `bucket_sec` 자동 산출(기간/max_points). 60초 미만이면 기존 경로(완전 하위호환).
-  - 버킷 집계: `CAST(strftime('%s', collected_at) AS INTEGER) / bucket_sec` GROUP BY, 지표는 `AVG(...)`(피크 보존 필요 시 MAX 병행). 대표 시각 `MIN(collected_at)`.
-  - **최대 함정**: `collected_at`은 KST aware로 저장 — SQLite에 오프셋 포함 문자열로 저장되므로 `strftime('%s', ...)`가 이를 처리하는지 실제 저장 포맷으로 반드시 확인. 불일치 시 `julianday`/`unixepoch()` 사용.
-  - `interface_mbps`(JSON 문자열)는 SQL 집계 불가 → 버킷 내 마지막 행(`MAX(id)`) 값 대표.
-  - 응답은 기존 `ResourceUsageSchema` 리스트 형태 유지 → 프런트 `resource_history.js` 무수정 동작. (선택: 요청에 `max_points=2000` 한 줄 추가)
-- **검증**: 짧은/긴 기간 각각 스키마 동일성, sqlite3 CLI 수동 집계와 AVG spot-check, 차트 렌더 확인.
-
-### 2-4. resource_analysis 대량 쿼리 1회화
-
-- **현재**: `app/services/resource_analysis.py`의 `_base_query(...).all()`이 6곳 반복 — 같은 화면에서 지표별로 동일 대량 쿼리 재실행.
-- **변경(최소)**: `.all()`을 `with_entities(proxy_id, collected_at, 필요한 metric 컬럼)`로 축소. 한 요청에서 여러 compute를 부르는 API 핸들러만 행을 한 번 조회해 `rows: Optional[List]` 인자로 전달.
-- **계약**: 결과 수치 완전 불변. 변경 전후 각 분석 API 응답 JSON diff로 검증.
 
 ## Phase 3 — 선택 (필요 시)
 

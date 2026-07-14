@@ -76,6 +76,61 @@ def test_history_invalid_time_returns_400(client, seeded):
     assert r.status_code == 400
 
 
+def test_history_downsampling_buckets_and_averages(client, db_session):
+    """구간이 길어 버킷 폭 >= 60초가 되면 시간 버킷 평균으로 집계된다 (Phase 2-3)."""
+    from datetime import datetime
+
+    p = Proxy(host="10.9.2.9", port=22)
+    db_session.add(p)
+    db_session.commit()
+
+    # 2026-01-01 00:00(KST 벽시계)은 600초 버킷 경계에 정렬됨
+    t0 = datetime(2026, 1, 1, 0, 0, 0)
+    rows = [
+        # 버킷 1: 10초·20초 시점 → cpu 평균 15
+        ResourceUsage(proxy_id=p.id, cpu=10.0, collected_at=t0 + timedelta(seconds=10),
+                      created_at=t0, updated_at=t0),
+        ResourceUsage(proxy_id=p.id, cpu=20.0, interface_mbps='{"eth0": {"in_mbps": 1.5, "out_mbps": 0.5}}',
+                      collected_at=t0 + timedelta(seconds=20), created_at=t0, updated_at=t0),
+        # 버킷 2: 15분 시점
+        ResourceUsage(proxy_id=p.id, cpu=60.0, collected_at=t0 + timedelta(seconds=900),
+                      created_at=t0, updated_at=t0),
+    ]
+    db_session.add_all(rows)
+    db_session.commit()
+
+    # 구간 60,000초 / max_points=100 → 버킷 600초
+    resp = client.get("/api/history", params={
+        "proxy_id": p.id,
+        "start_time": "2026-01-01T00:00:00+09:00",
+        "end_time": "2026-01-01T16:40:00+09:00",
+        "max_points": 100,
+    })
+    assert resp.status_code == 200
+    out = resp.json()
+    assert len(out) == 2  # 3행 → 2버킷
+
+    # collected_at desc: 첫 항목이 늦은 버킷
+    assert out[0]["cpu"] == 60.0
+    assert out[1]["cpu"] == 15.0  # (10+20)/2
+    # 버킷 대표 시각은 버킷 내 최소 collected_at
+    assert out[1]["collected_at"].startswith("2026-01-01T00:00:10")
+    # interface_mbps는 버킷 내 마지막 행의 값
+    assert out[1]["interface_mbps"] == {"eth0": {"in_mbps": 1.5, "out_mbps": 0.5}}
+    # 스키마 필드 유지
+    for key in ("id", "proxy_id", "mem", "disk", "collected_at"):
+        assert key in out[0]
+
+
+def test_history_short_range_returns_raw_rows(client, seeded):
+    """버킷 폭 60초 미만이면 원본 행 그대로 (하위호환 경로)."""
+    rows = client.get("/api/history", params={
+        "proxy_id": seeded["p1"], "max_points": 20000,
+    }).json()
+    assert len(rows) == 6  # 집계 없이 원본 6행
+    assert sorted(r["cpu"] for r in rows) == [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+
+
 def test_stats_contract(client, seeded):
     s = client.get("/api/resource-usage/stats").json()
     assert s["total_count"] == 7

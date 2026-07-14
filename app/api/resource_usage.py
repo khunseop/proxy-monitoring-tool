@@ -236,6 +236,16 @@ async def get_active_interfaces(
     return result[:limit]
 
 
+_HISTORY_METRICS = ("cpu", "mem", "cc", "cs", "http", "https", "http2", "blocked", "disk")
+
+
+def _as_datetime(value):
+    """SQLite 집계 결과(min/max)는 문자열로 올 수 있으므로 datetime으로 정규화."""
+    if value is None or isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
+
+
 @router.get("/history", response_model=List[ResourceUsageSchema])
 async def get_resource_usage_history(
     db: Session = Depends(get_db),
@@ -243,6 +253,7 @@ async def get_resource_usage_history(
     proxy_ids: Optional[str] = Query(None),
     start_time: Optional[str] = Query(None),
     end_time: Optional[str] = Query(None),
+    max_points: int = Query(2000, ge=100, le=20000),
 ):
     query = db.query(ResourceUsageModel)
     if proxy_id:
@@ -254,22 +265,89 @@ async def get_resource_usage_history(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid proxy_ids format.")
 
+    start_dt = end_dt = None
     if start_time:
         try:
             dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
             if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-            query = query.filter(ResourceUsageModel.collected_at >= dt.astimezone(KST_TZ))
+            start_dt = dt.astimezone(KST_TZ)
+            query = query.filter(ResourceUsageModel.collected_at >= start_dt)
         except ValueError: raise HTTPException(status_code=400, detail="Invalid start_time.")
 
     if end_time:
         try:
             dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
             if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-            query = query.filter(ResourceUsageModel.collected_at <= dt.astimezone(KST_TZ))
+            end_dt = dt.astimezone(KST_TZ)
+            query = query.filter(ResourceUsageModel.collected_at <= end_dt)
         except ValueError: raise HTTPException(status_code=400, detail="Invalid end_time.")
 
-    rows = query.order_by(ResourceUsageModel.collected_at.desc()).all()
-    return rows
+    # 조회 구간이 max_points로 감당 못할 만큼 길면 시간 버킷 평균으로 다운샘플링.
+    # 버킷 폭이 60초 미만이면(= 수집 주기 수준) 기존 원본 경로 그대로 — 완전 하위호환.
+    from sqlalchemy import func, Integer
+
+    span_start, span_end = start_dt, end_dt
+    if span_start is None or span_end is None:
+        lo, hi = query.with_entities(
+            func.min(ResourceUsageModel.collected_at),
+            func.max(ResourceUsageModel.collected_at),
+        ).one()
+        span_start = span_start or _as_datetime(lo)
+        span_end = span_end or _as_datetime(hi)
+
+    bucket_sec = 0
+    if span_start is not None and span_end is not None:
+        # 저장값이 naive(KST 벽시계)라 min/max 결과와 tz-aware 파라미터가 섞일 수 있음
+        s = span_start.replace(tzinfo=None) if span_start.tzinfo else span_start
+        e = span_end.replace(tzinfo=None) if span_end.tzinfo else span_end
+        bucket_sec = int(max(0.0, (e - s).total_seconds()) // max_points)
+
+    if bucket_sec < 60:
+        rows = query.order_by(ResourceUsageModel.collected_at.desc()).all()
+        return rows
+
+    # 주의: strftime('%s')는 naive KST 문자열을 UTC로 해석해 실제 epoch와 +9h 차이가
+    # 나지만, 상수 오프셋이므로 버킷 경계는 균일하게 유지된다 (그룹핑 용도로 안전).
+    bucket = func.cast(func.strftime('%s', ResourceUsageModel.collected_at), Integer).op('/')(bucket_sec)
+    agg_rows = (
+        query.with_entities(
+            ResourceUsageModel.proxy_id.label("proxy_id"),
+            bucket.label("bucket"),
+            func.max(ResourceUsageModel.id).label("max_id"),
+            func.min(ResourceUsageModel.collected_at).label("bucket_start"),
+            *[func.avg(getattr(ResourceUsageModel, m)).label(m) for m in _HISTORY_METRICS],
+        )
+        .group_by(ResourceUsageModel.proxy_id, bucket)
+        .order_by(func.min(ResourceUsageModel.collected_at).desc())
+        .all()
+    )
+
+    # interface_mbps(JSON)·메타 필드는 버킷 내 마지막 행(max_id)의 값을 대표로 사용
+    base_rows = {
+        r.id: r
+        for r in db.query(ResourceUsageModel)
+        .filter(ResourceUsageModel.id.in_([a.max_id for a in agg_rows]))
+        .all()
+    }
+
+    out = []
+    for a in agg_rows:
+        base = base_rows.get(a.max_id)
+        item = {
+            "id": a.max_id,
+            "proxy_id": a.proxy_id,
+            "collected_at": _as_datetime(a.bucket_start),
+            "created_at": base.created_at if base else None,
+            "updated_at": base.updated_at if base else None,
+            "community": base.community if base else None,
+            "oids_raw": base.oids_raw if base else None,
+            "interface_mbps": base.interface_mbps if base else None,
+        }
+        for m in _HISTORY_METRICS:
+            v = getattr(a, m)
+            item[m] = round(v, 3) if v is not None else None
+        out.append(item)
+    return out
 
 
 class ResourceUsageStatsResponse(BaseModel):

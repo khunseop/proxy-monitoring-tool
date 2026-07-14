@@ -449,87 +449,117 @@ def analyze_db_traffic_logs(
     if not p_ids:
         raise HTTPException(status_code=400, detail="proxy_ids required")
 
-    from collections import Counter, defaultdict
+    # 전체 행을 파이썬으로 로드하지 않고 SQL 집계로 처리 (대량 로그에서 메모리·응답시간 절감).
+    # 집계 의미는 기존 파이썬 구현과 동일해야 한다:
+    #  - 음수 recv/sent는 0으로 클램프, NULL은 0
+    #  - blocked는 action_names의 trim+lower == 'block'
+    #  - 빈/NULL client_ip·url_host는 클라이언트/호스트 집계에서 제외
+    from sqlalchemy import func, case, distinct, and_
 
-    rows = db.query(TrafficLogModel).filter(TrafficLogModel.proxy_id.in_(p_ids)).all()
-
-    host_counter: Counter = Counter()
-    client_req_counter: Counter = Counter()
-    status_counter: Counter = Counter()
-    proxy_counter: Counter = Counter()
-    client_recv: defaultdict = defaultdict(int)
-    client_sent: defaultdict = defaultdict(int)
-    client_blocked: defaultdict = defaultdict(int)
-    client_errors: defaultdict = defaultdict(int)
-    host_recv: defaultdict = defaultdict(int)
-    host_sent: defaultdict = defaultdict(int)
-
-    blocked = 0
-    total_recv = 0
-    total_sent = 0
-    unique_clients: set = set()
-    unique_hosts: set = set()
+    pf = TrafficLogModel.proxy_id.in_(p_ids)
+    recv_pos = case((TrafficLogModel.recv_byte > 0, TrafficLogModel.recv_byte), else_=0)
+    sent_pos = case((TrafficLogModel.sent_byte > 0, TrafficLogModel.sent_byte), else_=0)
+    is_block = case(
+        (func.lower(func.trim(TrafficLogModel.action_names)) == "block", 1), else_=0
+    )
+    is_error = case(
+        (and_(TrafficLogModel.response_statuscode >= 400,
+              TrafficLogModel.response_statuscode < 600), 1),
+        else_=0,
+    )
+    client_nonempty = and_(TrafficLogModel.client_ip.isnot(None), TrafficLogModel.client_ip != "")
+    host_nonempty = and_(TrafficLogModel.url_host.isnot(None), TrafficLogModel.url_host != "")
 
     proxy_map: Dict[int, str] = {}
     for p in db.query(Proxy).filter(Proxy.id.in_(p_ids)).all():
         proxy_map[p.id] = p.host
 
-    for row in rows:
-        client_ip = str(row.client_ip or "")
-        url_host = str(row.url_host or "")
-        status = str(row.response_statuscode or "Unknown")
-        recv_b = int(row.recv_byte or 0)
-        sent_b = int(row.sent_byte or 0)
-        action = str(row.action_names or "")
-        proxy_label = proxy_map.get(row.proxy_id, f"#{row.proxy_id}")
+    total, blocked, total_recv, total_sent = db.query(
+        func.count(),
+        func.coalesce(func.sum(is_block), 0),
+        func.coalesce(func.sum(recv_pos), 0),
+        func.coalesce(func.sum(sent_pos), 0),
+    ).select_from(TrafficLogModel).filter(pf).one()
 
-        if client_ip:
-            client_req_counter[client_ip] += 1
-            unique_clients.add(client_ip)
-            client_recv[client_ip] += max(0, recv_b)
-            client_sent[client_ip] += max(0, sent_b)
-            if action.strip().lower() == "block":
-                client_blocked[client_ip] += 1
-            try:
-                sc = int(row.response_statuscode or 0)
-                if 400 <= sc < 600:
-                    client_errors[client_ip] += 1
-            except Exception:
-                pass
-        if url_host:
-            host_counter[url_host] += 1
-            unique_hosts.add(url_host)
-            host_recv[url_host] += max(0, recv_b)
-            host_sent[url_host] += max(0, sent_b)
+    unique_clients = db.query(func.count(distinct(TrafficLogModel.client_ip))).filter(pf, client_nonempty).scalar() or 0
+    unique_hosts = db.query(func.count(distinct(TrafficLogModel.url_host))).filter(pf, host_nonempty).scalar() or 0
 
-        status_counter[status] += 1
-        proxy_counter[proxy_label] += 1
-
-        if action.strip().lower() == "block":
-            blocked += 1
-        total_recv += max(0, recv_b)
-        total_sent += max(0, sent_b)
-
+    host_rows = (
+        db.query(
+            TrafficLogModel.url_host,
+            func.count().label("requests"),
+            func.coalesce(func.sum(recv_pos), 0),
+            func.coalesce(func.sum(sent_pos), 0),
+        )
+        .filter(pf, host_nonempty)
+        .group_by(TrafficLogModel.url_host)
+        .order_by(func.count().desc())
+        .all()
+    )
     hosts = [
-        {"host": h, "requests": c, "recv_bytes": host_recv[h], "sent_bytes": host_sent[h]}
-        for h, c in host_counter.most_common()
+        {"host": h, "requests": c, "recv_bytes": int(r), "sent_bytes": int(s)}
+        for h, c, r, s in host_rows
     ]
+
+    client_rows = (
+        db.query(
+            TrafficLogModel.client_ip,
+            func.count().label("requests"),
+            func.coalesce(func.sum(recv_pos), 0),
+            func.coalesce(func.sum(sent_pos), 0),
+            func.coalesce(func.sum(is_block), 0),
+            func.coalesce(func.sum(is_error), 0),
+        )
+        .filter(pf, client_nonempty)
+        .group_by(TrafficLogModel.client_ip)
+        .order_by(func.count().desc())
+        .all()
+    )
     clients = [
-        {"client_ip": ip, "requests": c, "recv_bytes": client_recv[ip], "sent_bytes": client_sent[ip]}
-        for ip, c in client_req_counter.most_common()
+        {"client_ip": ip, "requests": c, "recv_bytes": int(r), "sent_bytes": int(s)}
+        for ip, c, r, s, _, _ in client_rows
     ]
-    statuses = [{"status": s, "count": c} for s, c in status_counter.most_common()]
-    proxies_dist = [{"proxy": p, "count": c} for p, c in proxy_counter.most_common()]
+    client_blocked = {ip: int(b) for ip, _, _, _, b, _ in client_rows if b}
+    client_errors = {ip: int(e) for ip, _, _, _, _, e in client_rows if e}
+
+    status_rows = (
+        db.query(TrafficLogModel.response_statuscode, func.count())
+        .filter(pf)
+        .group_by(TrafficLogModel.response_statuscode)
+        .order_by(func.count().desc())
+        .all()
+    )
+    # NULL과 0은 모두 "Unknown"으로 병합 (기존 파이썬 집계와 동일)
+    status_counts: Dict[str, int] = {}
+    for sc, c in status_rows:
+        label = str(sc) if sc else "Unknown"
+        status_counts[label] = status_counts.get(label, 0) + c
+    statuses = [
+        {"status": s, "count": c}
+        for s, c in sorted(status_counts.items(), key=lambda x: -x[1])
+    ]
+
+    proxy_rows = (
+        db.query(TrafficLogModel.proxy_id, func.count())
+        .filter(pf)
+        .group_by(TrafficLogModel.proxy_id)
+        .order_by(func.count().desc())
+        .all()
+    )
+    proxies_dist = [
+        {"proxy": proxy_map.get(pid, f"#{pid}"), "count": c} for pid, c in proxy_rows
+    ]
+
     anomalies = _detect_traffic_anomalies(clients, client_blocked, client_errors)
 
     return {
         "summary": {
-            "total": len(rows),
-            "blocked": blocked,
-            "unique_clients": len(unique_clients),
-            "unique_hosts": len(unique_hosts),
-            "total_recv_bytes": total_recv,
-            "total_sent_bytes": total_sent,
+            "total": total,
+            "blocked": int(blocked),
+            "unique_clients": unique_clients,
+            "unique_hosts": unique_hosts,
+            "total_recv_bytes": int(total_recv),
+            "total_sent_bytes": int(total_sent),
         },
         "hosts": hosts,
         "clients": clients,
