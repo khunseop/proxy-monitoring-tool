@@ -1,0 +1,13 @@
+# 저장소 내 텍스트 파일의 줄바꿈을 LF로 통일한다.
+# 개발은 macOS(LF)에서, 배포/실행은 Windows(운영망, .bat 스크립트)에서 이뤄지는데
+# 이 파일이 없으면 Windows의 core.autocrlf 설정에 따라 체크아웃 시 줄바꿈이
+# 임의로 CRLF로 바뀌어 매번 "커밋되지 않은 로컬 변경"으로 잡히고
+# deploy.bat/run_prod.bat이 이를 stash했다가 복원하지 못해 오류가 났다.
+* text=auto eol=lf
+
+# Windows 배치 스크립트는 CRLF를 유지해야 일부 환경에서 안전하게 동작한다.
+*.bat text eol=crlf
+
+*.png binary
+*.ico binary
+*.db binary
