@@ -177,7 +177,7 @@ _app_start_time = _time.monotonic()
 app = FastAPI(
     title="PMT",
     description="Proxy Monitoring Tool",
-    version="2026.06.18"
+    version="2026.07.15"
 )
 
 # 전역 예외 핸들러 — 스택 트레이스 유출 방지
