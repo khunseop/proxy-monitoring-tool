@@ -156,6 +156,17 @@ $(document).ready(function() {
                 const newContent = doc.querySelector('.main-content .container');
 
                 if (newContent) {
+                    // 이미 로드된 src 스크립트 기록 (최초 1회, 콘텐츠 교체 전에 수집)
+                    if (!window._pjaxLoadedScripts) {
+                        window._pjaxLoadedScripts = new Set(
+                            Array.from(document.querySelectorAll('script[src]')).map(s => s.src)
+                        );
+                    }
+                    // 스크립트는 아래에서 직접 1회만 실행 — jQuery .html()의 자동 실행
+                    // (매번 캐시버스터로 재다운로드 + 중복 실행) 방지를 위해 미리 분리한다.
+                    const pageScripts = Array.from(newContent.querySelectorAll('script'));
+                    pageScripts.forEach(s => s.remove());
+
                     $content.html(newContent.innerHTML);
 
                     // 서브네비 교체
@@ -168,15 +179,20 @@ $(document).ready(function() {
                     $('.navbar-item').removeClass('is-active');
                     $(`.navbar-item[href="${url}"], .navbar-item[href="${url.split('?')[0]}"]`).addClass('is-active');
 
-                    // Re-run scripts in the new content
-                    $content.find('script').each(function() {
+                    // 페이지 스크립트 실행: src 스크립트는 세션 중 1회만 로드하고,
+                    // 재방문 시 재초기화는 각 스크립트의 pjax:complete 핸들러가 담당한다.
+                    pageScripts.forEach(function(s) {
                         const newScript = document.createElement('script');
-                        if (this.src) {
-                            newScript.src = this.src;
+                        if (s.src) {
+                            if (window._pjaxLoadedScripts.has(s.src)) return;
+                            window._pjaxLoadedScripts.add(s.src);
+                            newScript.async = false; // 삽입 순서대로 실행 (스크립트 간 의존성 보장)
+                            newScript.src = s.src;
+                            document.body.appendChild(newScript);
                         } else {
-                            newScript.textContent = this.textContent;
+                            newScript.textContent = s.textContent;
+                            document.body.appendChild(newScript).parentNode.removeChild(newScript);
                         }
-                        document.body.appendChild(newScript).parentNode.removeChild(newScript);
                     });
 
                     // Scroll to top

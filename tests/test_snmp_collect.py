@@ -76,12 +76,22 @@ def test_get_many_retries_transient_failure(fake_snmp):
     assert len(fake_snmp.get_calls) == 2
 
 
-def test_get_many_total_failure_returns_none_without_fallback(fake_snmp):
-    fake_snmp.fail_times = 99  # 계속 실패 (타임아웃성)
+def test_get_many_timeout_falls_back_to_individual(fake_snmp, monkeypatch):
+    """일부 에이전트는 모르는 OID가 섞인 multi-get을 응답 없이 버린다(타임아웃).
+    이 경우에도 개별 GET 폴백으로 살릴 수 있는 지표를 회수해야 한다."""
+    fake_snmp.fail_times = 99  # multi-get은 계속 실패 (타임아웃성)
+
+    individual_calls = []
+
+    async def fake_single(host, port, community, oid, timeout_sec=2):
+        individual_calls.append(oid)
+        return 7.0 if oid == "1.1" else None
+
+    monkeypatch.setattr(rc, "snmp_get", fake_single)
     res = asyncio.run(rc.snmp_get_many("h", 161, "public", ["1.1", "1.2"]))
-    assert res == {"1.1": None, "1.2": None}
-    # 타임아웃은 장비 다운 상황 — 개별 GET 폴백 없이 즉시 None (재시도 2회만)
-    assert len(fake_snmp.get_calls) == 2
+    assert sorted(individual_calls) == ["1.1", "1.2"]
+    assert res["1.1"] == 7.0
+    assert res["1.2"] is None
 
 
 def test_get_many_protocol_error_falls_back_to_individual(fake_snmp, monkeypatch):

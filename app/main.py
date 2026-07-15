@@ -258,6 +258,25 @@ templates = Jinja2Templates(directory=get_templates_dir())
 app.mount("/static", StaticFiles(directory=get_static_dir()), name="static")
 app.mount("/docs-static", StaticFiles(directory=get_docs_dir()), name="docs-static")
 
+
+def _static_assets_mtime(static_dir: str) -> int:
+    """static 파일의 최근 수정 시각 — 템플릿 ?v= 캐시버스팅에 사용.
+
+    JS/CSS가 바뀌면 값이 자동으로 갱신되어, 버전 문자열을 수동으로
+    올리지 않아도 브라우저가 옛 파일을 캐시에서 계속 쓰는 일을 막는다.
+    """
+    latest = 0
+    for root, _, files in os.walk(static_dir):
+        for fn in files:
+            try:
+                latest = max(latest, int(os.path.getmtime(os.path.join(root, fn))))
+            except OSError:
+                continue
+    return latest
+
+
+app.version = f"{app.version}.{_static_assets_mtime(get_static_dir())}"
+
 # API 라우터
 app.include_router(proxies.router, prefix="/api", tags=["proxies"])
 app.include_router(proxy_groups.router, prefix="/api", tags=["proxy-groups"])

@@ -361,8 +361,12 @@ class BackgroundCollector:
 
             oids_raw = json_lib.loads(cfg.oids_json or '{}')
             oids = {k: v for k, v in oids_raw.items() if not k.startswith('__')}
-            if not oids:
-                logger.info("[BackgroundCollector] OID 미설정 — 자동 수집 건너뜀")
+            interface_oids = oids_raw.get('__interface_oids__') or {}
+            if not oids and not interface_oids:
+                logger.warning(
+                    "[BackgroundCollector] OID 미설정 — 자동 수집 건너뜀. "
+                    "설정 페이지에서 수집할 OID를 등록하세요."
+                )
                 return
 
             proxy_ids = [p.id for p in proxies]

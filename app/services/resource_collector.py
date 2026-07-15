@@ -79,7 +79,7 @@ async def snmp_get_many(
         last_exc: Exception | None = None
         for _ in range(max(1, attempts)):
             try:
-                async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
+                async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=0) as snmp:
                     varbinds = await snmp.get(chunk)
                 break
             except SnmpErrorStatus as exc:
@@ -90,17 +90,18 @@ async def snmp_get_many(
                 last_exc = exc
 
         if varbinds is None:
-            if protocol_error:
-                # v1 등에서 OID 1개 때문에 전체가 실패한 경우 → 개별 조회로 살릴 수 있는 지표 회수
-                logger.warning(
-                    f"[resource_collector] SNMP multi-get protocol error host={host}: {last_exc} — 개별 GET 폴백"
-                )
-                for oid in chunk:
-                    result[oid] = await snmp_get(host, port, community, oid, timeout_sec)
-            else:
-                logger.warning(
-                    f"[resource_collector] SNMP multi-get failed host={host} oids={len(chunk)}: {last_exc}"
-                )
+            # 프로토콜 오류(v1은 잘못된 OID 1개로 전체 GET 실패)뿐 아니라,
+            # 일부 에이전트는 모르는 OID가 섞인 multi-get을 응답 없이 버려 타임아웃이 난다.
+            # 어느 쪽이든 개별 GET으로 폴백해 살릴 수 있는 지표를 회수한다.
+            reason = "protocol error" if protocol_error else "failed"
+            logger.warning(
+                f"[resource_collector] SNMP multi-get {reason} host={host} oids={len(chunk)}: {last_exc!r} — 개별 GET 폴백"
+            )
+            values = await asyncio.gather(
+                *(snmp_get(host, port, community, oid, timeout_sec) for oid in chunk)
+            )
+            for oid, value in zip(chunk, values):
+                result[oid] = value
             continue
 
         by_norm = {oid.lstrip('.'): oid for oid in chunk}
@@ -118,7 +119,7 @@ async def snmp_get_many(
 
 async def snmp_get(host: str, port: int, community: str, oid: str, timeout_sec: int = 2) -> float | None:
     try:
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
+        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
             values = await snmp.get(oid)
             if values and len(values) > 0:
                 value = float(values[0].value)
@@ -127,14 +128,14 @@ async def snmp_get(host: str, port: int, community: str, oid: str, timeout_sec: 
             logger.warning(f"[resource_collector] SNMP get returned no values host={host} oid={oid}")
             return None
     except Exception as exc:
-        logger.warning(f"[resource_collector] SNMP get failed host={host} oid={oid}: {exc}")
+        logger.warning(f"[resource_collector] SNMP get failed host={host} oid={oid}: {exc!r}")
         return None
 
 
 async def snmp_walk(host: str, port: int, community: str, oid: str, timeout_sec: int = 5) -> Dict[int, int]:
     result: Dict[int, int] = {}
     try:
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
+        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
             values = await snmp.walk(oid)
             if values:
                 base_oid_parts = len(oid.split('.'))
@@ -156,7 +157,7 @@ async def snmp_walk(host: str, port: int, community: str, oid: str, timeout_sec:
 async def snmp_walk_string(host: str, port: int, community: str, oid: str, timeout_sec: int = 5) -> Dict[int, str]:
     result: Dict[int, str] = {}
     try:
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
+        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
             values = await snmp.walk(oid)
             if values:
                 base_oid_parts = len(oid.split('.'))
