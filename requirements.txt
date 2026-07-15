@@ -1,3 +1,6 @@
+# Python 3.10~3.11 사용 권장 (py -3.10 -m venv .venv):
+# aiosnmp(Rust 확장 모듈)가 3.12+ 사전빌드 wheel을 제공하지 않아
+# 새 Python으로 venv를 만들면 "Failed building wheel for aiosnmp"로 실패한다.
 fastapi>=0.116,<0.117
 uvicorn>=0.35,<0.36
 sqlalchemy>=2.0,<2.1
