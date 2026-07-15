@@ -122,7 +122,9 @@ async def snmp_get_many(
 
 async def snmp_get(host: str, port: int, community: str, oid: str, timeout_sec: int = 2) -> float | None:
     try:
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
+        # retries 미지정 시 aiosnmp 기본값(6회) 적용 — 순간적인 패킷 유실/응답 지연에
+        # 대한 내성을 위해 명시적으로 낮추지 않는다.
+        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
             values = await snmp.get(oid)
             if values and len(values) > 0:
                 value = float(values[0].value)
@@ -138,7 +140,7 @@ async def snmp_get(host: str, port: int, community: str, oid: str, timeout_sec: 
 async def snmp_walk(host: str, port: int, community: str, oid: str, timeout_sec: int = 5) -> Dict[int, int]:
     result: Dict[int, int] = {}
     try:
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
+        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
             values = await snmp.walk(oid)
             if values:
                 base_oid_parts = len(oid.split('.'))
@@ -160,7 +162,7 @@ async def snmp_walk(host: str, port: int, community: str, oid: str, timeout_sec:
 async def snmp_walk_string(host: str, port: int, community: str, oid: str, timeout_sec: int = 5) -> Dict[int, str]:
     result: Dict[int, str] = {}
     try:
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
+        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
             values = await snmp.walk(oid)
             if values:
                 base_oid_parts = len(oid.split('.'))
