@@ -49,8 +49,9 @@ echo        완료. ^(브랜치: %CURRENT_BRANCH%^)
 
 echo.
 echo [3/3] 서버 실행 중...
-echo   python run_app.py  ^(기본 http://localhost:8712^)
+echo   python run_app.py  ^(기본 http://localhost:8712, 브라우저 자동 실행 없음^)
 echo ============================================
+set PMT_OPEN_BROWSER=false
 python run_app.py
 goto :end
 

@@ -80,7 +80,8 @@ def main() -> None:
     port = int(os.getenv("PORT", "8712"))
     url = f"http://{host}:{port}/"
 
-    open_browser_later(url, delay_sec=1.2)
+    if os.getenv("PMT_OPEN_BROWSER", "true").lower() not in {"0", "false", "no"}:
+        open_browser_later(url, delay_sec=1.2)
 
     if uvicorn is None:
         print(

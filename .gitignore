@@ -92,3 +92,8 @@ node_modules/
 
 # Corrupted database files
 *.db.corrupt
+
+# 배포용 번들 (deploy.bat이 생성) — 저장소에 커밋하면 안 됨:
+# run_prod.bat이 이 파일을 pull 소스로 열어둔 채 같은 파일을 워킹트리에
+# 체크아웃하려다 Windows 파일 잠금 충돌로 파일이 사라지는 문제가 있었음.
+pmt.bundle
