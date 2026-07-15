@@ -57,14 +57,17 @@ def test_get_many_maps_values_with_dot_normalization(fake_snmp):
     assert res["1.3.6.1.1"] == 10.0
     assert res[".1.3.6.1.2"] == 20.0    # 요청 표기 그대로 키 유지
     assert res["1.3.6.1.9"] is None     # 응답에 없는 OID
-    assert len(fake_snmp.get_calls) == 1  # 단일 GET
+    assert len(fake_snmp.get_calls) == 3  # OID별 개별 GET
 
 
-def test_get_many_chunks_large_requests(fake_snmp):
+def test_get_many_issues_individual_gets_for_multiple_oids(fake_snmp):
+    # 일부 장비의 SNMP 에이전트가 multi-OID GET을 응답 없이 버려(타임아웃) 나는
+    # 수집 실패를 막기 위해 OID마다 별도 GET을 보낸다(배치 없음).
     oids = [f"1.2.3.{i}" for i in range(20)]
     fake_snmp.responses = {o: i for i, o in enumerate(oids)}
     res = asyncio.run(rc.snmp_get_many("h", 161, "public", oids))
-    assert len(fake_snmp.get_calls) == 2  # 16 + 4
+    assert len(fake_snmp.get_calls) == 20
+    assert all(len(call) == 1 for call in fake_snmp.get_calls)
     assert all(res[o] == float(i) for i, o in enumerate(oids))
 
 
@@ -95,8 +98,9 @@ def test_get_many_timeout_falls_back_to_individual(fake_snmp, monkeypatch):
 
 
 def test_get_many_protocol_error_falls_back_to_individual(fake_snmp, monkeypatch):
+    # OID마다 개별 GET을 보내므로, 프로토콜 오류는 그 OID의 요청 1회만 소모한다.
     fake_snmp.fail_times = 1
-    fake_snmp.fail_exc = SnmpErrorStatus(2, "1.2")
+    fake_snmp.fail_exc = SnmpErrorStatus(2, "1.1")
 
     individual_calls = []
 
@@ -106,9 +110,9 @@ def test_get_many_protocol_error_falls_back_to_individual(fake_snmp, monkeypatch
 
     monkeypatch.setattr(rc, "snmp_get", fake_single)
     res = asyncio.run(rc.snmp_get_many("h", 161, "public", ["1.1", "1.2"]))
-    assert individual_calls == ["1.1", "1.2"]  # v1식 실패 → 개별 폴백으로 생존 지표 회수
+    assert individual_calls == ["1.1"]  # v1식 실패 → 해당 OID만 개별 폴백
     assert res["1.1"] == 42.0
-    assert res["1.2"] is None
+    assert res["1.2"] is None  # 응답에 없는 OID (정상 GET, 값 없음)
 
 
 # ── collect_for_proxy: 단일 GET 결과가 기존 델타 로직에 그대로 흐르는지 ──
@@ -123,7 +127,7 @@ def _mk_proxy(pid=1):
 OIDS = {"cpu": "1.3.1", "http": "1.3.2"}
 
 
-def test_collect_for_proxy_uses_single_get_and_delta(fake_snmp):
+def test_collect_for_proxy_uses_individual_gets_and_delta(fake_snmp):
     rc._GLOBAL_TRAFFIC_COUNTER_CACHE.clear()
     proxy = _mk_proxy(pid=101)
 
@@ -133,7 +137,7 @@ def test_collect_for_proxy_uses_single_get_and_delta(fake_snmp):
     assert err is None
     assert result["cpu"] == 37.0
     assert result["http"] == 0.0
-    assert len(fake_snmp.get_calls) == 1  # 지표 2개가 GET 1회로
+    assert len(fake_snmp.get_calls) == 2  # 지표 2개 → OID별 개별 GET
 
     # 2주기: 카운터 증가 → mbps 델타 계산됨
     # (델타는 time_diff >= 1초 조건이 있으므로 캐시 시각을 10초 전으로 조정)
@@ -158,14 +162,14 @@ def test_collect_for_proxy_snmp_down_returns_none_metrics(fake_snmp):
     rc._GLOBAL_TRAFFIC_COUNTER_CACHE.clear()
 
 
-def test_collect_interface_mbps_single_get(fake_snmp):
+def test_collect_interface_mbps_individual_gets(fake_snmp):
     rc._INTERFACE_COUNTER_CACHE.clear()
     proxy = _mk_proxy(pid=103)
     if_oids = {"eth0": {"in_oid": "1.4.1", "out_oid": "1.4.2"}}
 
     fake_snmp.responses = {"1.4.1": 1000, "1.4.2": 2000}
     r1 = asyncio.run(rc.collect_interface_mbps_from_oids(proxy, "public", if_oids))
-    assert len(fake_snmp.get_calls) == 1  # in/out이 GET 1회로
+    assert len(fake_snmp.get_calls) == 2  # in/out → OID별 개별 GET
     assert r1["eth0"]["in_mbps"] == 0.0   # 프라이밍
 
     for direction in ("in", "out"):

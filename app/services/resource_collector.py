@@ -45,8 +45,11 @@ _SSH_SEMAPHORE = asyncio.Semaphore(_SSH_MAX_CONCURRENCY)
 _SSH_TIMEOUT_SEC = max(1, int(os.getenv("RU_SSH_TIMEOUT_SEC", "5")))
 
 
-# 한 GET 요청에 담는 최대 OID 수 (PDU 크기 제한 대비)
-_SNMP_CHUNK_SIZE = 16
+# 한 GET 요청에 담는 최대 OID 수.
+# 일부 프록시 장비의 SNMP 에이전트는 한 PDU에 OID 여러 개를 담은 multi-get을
+# 제대로 처리하지 못하고 응답 없이 버려(타임아웃) 수집이 전면 실패한다.
+# 안정적으로 동작이 확인된 개별 GET과 동일하게 1로 고정한다.
+_SNMP_CHUNK_SIZE = 1
 
 
 async def snmp_get_many(
