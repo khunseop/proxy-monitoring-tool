@@ -60,8 +60,10 @@ async def snmp_get_many(
     timeout_sec: int = 2,
     attempts: int = 2,
 ) -> Dict[str, float | None]:
-    """여러 OID를 프록시당 한 번의 세션·GET(청크 단위)으로 조회한다.
+    """여러 OID를 청크(현재 크기 1) 단위로 동시에 조회한다.
 
+    - 청크들은 asyncio.gather로 동시에 조회되어, OID 하나가 응답 없어도
+      나머지 OID 조회를 지연시키지 않는다.
     - 일시적 실패(타임아웃 등)는 attempts회까지 재시도.
     - SNMP 프로토콜 오류(v1은 잘못된 OID 1개로 전체 GET이 실패)는
       해당 청크만 개별 snmp_get으로 폴백해 나머지 지표를 살린다.
@@ -76,7 +78,7 @@ async def snmp_get_many(
     unique_oids = list(dict.fromkeys(oids))
     chunks = [unique_oids[i:i + _SNMP_CHUNK_SIZE] for i in range(0, len(unique_oids), _SNMP_CHUNK_SIZE)]
 
-    for chunk in chunks:
+    async def _fetch_chunk(chunk: List[str]) -> None:
         varbinds = None
         protocol_error = False
         last_exc: Exception | None = None
@@ -108,7 +110,7 @@ async def snmp_get_many(
             )
             for oid, value in zip(chunk, values):
                 result[oid] = value
-            continue
+            return
 
         by_norm = {oid.lstrip('.'): oid for oid in chunk}
         for vb in varbinds:
@@ -119,6 +121,9 @@ async def snmp_get_many(
                 result[key] = float(vb.value)
             except (TypeError, ValueError):
                 result[key] = None  # NoSuchObject 등 값 없는 varbind
+
+    # 청크들은 서로 다른 OID를 다루므로 result 딕셔너리의 키가 겹치지 않아 동시 실행이 안전하다.
+    await asyncio.gather(*(_fetch_chunk(chunk) for chunk in chunks))
 
     return result
 
