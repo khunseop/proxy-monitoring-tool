@@ -82,7 +82,10 @@ async def snmp_get_many(
         last_exc: Exception | None = None
         for _ in range(max(1, attempts)):
             try:
-                async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=0) as snmp:
+                # retries=0은 aiosnmp에서 range(0)이 되어 패킷을 아예 보내지 않고
+                # 즉시 SnmpTimeoutError를 던진다 — 재시도는 이 바깥 attempts 루프가
+                # 담당하므로, 내부는 1회(=실제로 요청을 보내는 최소값)로 고정한다.
+                async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
                     varbinds = await snmp.get(chunk)
                 break
             except SnmpErrorStatus as exc:
