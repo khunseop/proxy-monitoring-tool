@@ -51,6 +51,12 @@ _SSH_TIMEOUT_SEC = max(1, int(os.getenv("RU_SSH_TIMEOUT_SEC", "5")))
 # 안정적으로 동작이 확인된 개별 GET과 동일하게 1로 고정한다.
 _SNMP_CHUNK_SIZE = 1
 
+# 청크(=OID) 단위 동시 조회 + 프록시 단위 동시 수집이 겹치면 열리는 UDP 소켓 수가
+# 급증해 select() 기반 이벤트 루프의 파일 디스크립터 한도를 넘길 수 있다.
+# 프로세스 전체에서 동시에 열리는 SNMP 세션 수를 제한한다.
+_SNMP_MAX_CONCURRENCY = max(1, int(os.getenv("RU_SNMP_MAX_CONCURRENCY", "200")))
+_SNMP_SEMAPHORE = asyncio.Semaphore(_SNMP_MAX_CONCURRENCY)
+
 
 async def snmp_get_many(
     host: str,
@@ -87,8 +93,9 @@ async def snmp_get_many(
                 # retries=0은 aiosnmp에서 range(0)이 되어 패킷을 아예 보내지 않고
                 # 즉시 SnmpTimeoutError를 던진다 — 재시도는 이 바깥 attempts 루프가
                 # 담당하므로, 내부는 1회(=실제로 요청을 보내는 최소값)로 고정한다.
-                async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
-                    varbinds = await snmp.get(chunk)
+                async with _SNMP_SEMAPHORE:
+                    async with Snmp(host=host, port=port, community=community, timeout=timeout_sec, retries=1) as snmp:
+                        varbinds = await snmp.get(chunk)
                 break
             except SnmpErrorStatus as exc:
                 protocol_error = True
@@ -132,7 +139,7 @@ async def snmp_get(host: str, port: int, community: str, oid: str, timeout_sec: 
     try:
         # retries 미지정 시 aiosnmp 기본값(6회) 적용 — 순간적인 패킷 유실/응답 지연에
         # 대한 내성을 위해 명시적으로 낮추지 않는다.
-        async with Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
+        async with _SNMP_SEMAPHORE, Snmp(host=host, port=port, community=community, timeout=timeout_sec) as snmp:
             values = await snmp.get(oid)
             if values and len(values) > 0:
                 value = float(values[0].value)
