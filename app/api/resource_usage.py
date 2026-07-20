@@ -247,7 +247,7 @@ def _as_datetime(value):
 
 
 @router.get("/history", response_model=List[ResourceUsageSchema])
-async def get_resource_usage_history(
+def get_resource_usage_history(
     db: Session = Depends(get_db),
     proxy_id: Optional[int] = Query(None),
     proxy_ids: Optional[str] = Query(None),
