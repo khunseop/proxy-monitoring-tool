@@ -359,7 +359,7 @@ class ResourceUsageStatsResponse(BaseModel):
 
 
 @router.get("/resource-usage/stats", response_model=ResourceUsageStatsResponse)
-async def get_resource_usage_stats(
+def get_resource_usage_stats(
     db: Session = Depends(get_db),
     proxy_id: Optional[int] = Query(None),
     proxy_ids: Optional[str] = Query(None)
