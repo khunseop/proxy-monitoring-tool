@@ -146,7 +146,7 @@ async def collect_resource_usage(payload: CollectRequest, db: Session = Depends(
 
 
 @router.get("/resource-usage", response_model=List[ResourceUsageSchema])
-async def list_resource_usage(
+def list_resource_usage(
     db: Session = Depends(get_db),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -162,7 +162,7 @@ async def list_resource_usage(
 
 
 @router.get("/resource-usage/latest/{proxy_id}", response_model=ResourceUsageSchema)
-async def latest_resource_usage(proxy_id: int, db: Session = Depends(get_db)):
+def latest_resource_usage(proxy_id: int, db: Session = Depends(get_db)):
     row = (
         db.query(ResourceUsageModel)
         .filter(ResourceUsageModel.proxy_id == proxy_id)
@@ -182,7 +182,7 @@ class ActiveInterfaceItem(BaseModel):
 
 
 @router.get("/resource-usage/active-interfaces", response_model=List[ActiveInterfaceItem])
-async def get_active_interfaces(
+def get_active_interfaces(
     proxy_id: Optional[int] = Query(None, description="Filter by proxy ID"),
     group_id: Optional[int] = Query(None, description="Filter by group ID"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of interfaces to return"),
@@ -405,7 +405,7 @@ class DeleteResourceUsageResponse(BaseModel):
 
 
 @router.delete("/resource-usage", response_model=DeleteResourceUsageResponse)
-async def delete_resource_usage(request: DeleteResourceUsageRequest, db: Session = Depends(get_db)):
+def delete_resource_usage(request: DeleteResourceUsageRequest, db: Session = Depends(get_db)):
     query = db.query(ResourceUsageModel)
     if request.proxy_id: query = query.filter(ResourceUsageModel.proxy_id == request.proxy_id)
     
@@ -426,7 +426,7 @@ async def delete_resource_usage(request: DeleteResourceUsageRequest, db: Session
 
 
 @router.get("/resource-usage/export")
-async def export_resource_usage(
+def export_resource_usage(
     db: Session = Depends(get_db),
     proxy_id: Optional[int] = Query(None),
     proxy_ids: Optional[str] = Query(None),
